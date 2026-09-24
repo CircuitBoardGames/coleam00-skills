@@ -88,6 +88,11 @@ the repo-local `.git/info/exclude` (never an edit to the tracked `.gitignore`).
 session (merges, deploys, notifies, spends), pass `--no-hooks`: it disables every hook in both arms.
 That also removes context a hook injects, so the report must say hook-delivered rules were not under test.
 
+**Under `-p`, `acceptEdits` approves edits and filesystem commands only**: every other Bash call is a
+prompt nobody answers, so no arm can run the test it wrote, and a rule about verifying work cannot be
+exercised. Pass the commands the task needs with `--allowed-tools`, e.g.
+`--allowed-tools 'Bash(python3 -m pytest:*)' 'Bash(sh -n:*)'`, rather than bypassing permissions.
+
 Useful flags: `--runs 3` when the user intends to act on the result, `--scope all`
 to test the harder claim that skills and subagents have expired too, `--model`,
 `--jobs` for concurrency, `--runner` for a non-Claude agent that reads a prompt on

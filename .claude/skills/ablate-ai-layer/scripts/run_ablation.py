@@ -110,7 +110,8 @@ NO_HOOKS_SETTINGS = '{"disableAllHooks": true}'
 
 
 def build_command(model: str | None, runner: str | None,
-                  no_hooks: bool = False) -> tuple[list[str] | str, bool]:
+                  no_hooks: bool = False,
+                  allowed_tools: list[str] | None = None) -> tuple[list[str] | str, bool]:
     """Returns (command, use_shell). The prompt always arrives on stdin, never in
     argv: Windows caps a command line at 32,767 chars and a real probe task plus
     its context blows through that as a misleading 'file not found'.
@@ -130,6 +131,11 @@ def build_command(model: str | None, runner: str | None,
     cmd = [exe, "-p", "--output-format", "json", "--permission-mode", "acceptEdits"]
     if no_hooks:
         cmd += ["--settings", NO_HOOKS_SETTINGS]
+    if allowed_tools:
+        # acceptEdits approves edits and filesystem commands only; under -p every other Bash call
+        # is a prompt nobody answers, so an agent cannot run the test it just wrote. Name the
+        # commands the task needs instead of bypassing permissions.
+        cmd += ["--allowedTools", *allowed_tools]
     if model:
         cmd += ["--model", model]
     return cmd, False
@@ -159,9 +165,21 @@ def exclude_results(root: Path, out: Path) -> str | None:
     return pattern
 
 
+def hide_stripped(wt: Path, removed: list[str]) -> None:
+    """Make the stripped files' absence invisible to git in this worktree.
+
+    Without this, the stripped arm's `git status` lists every removed file as deleted
+    (an agent reads that, and may restore it), and `git add -A` stages the deletion,
+    so the captured diff labels its own arm and reads as the agent deleting the
+    rules file. skip-worktree tells git to trust the index for these paths."""
+    if removed:
+        git(["update-index", "--skip-worktree", "--", *removed], wt)
+
+
 def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
             targets: list[dict], model: str | None, runner: str | None,
-            timeout: int, keep: bool, no_hooks: bool = False) -> dict:
+            timeout: int, keep: bool, no_hooks: bool = False,
+            allowed_tools: list[str] | None = None) -> dict:
     """One worktree, one agent session, one diff. Fresh worktree per run so runs
     never compound on each other."""
     tmp = Path(tempfile.mkdtemp(prefix=f"ablate-{arm}-{index}-"))
@@ -177,6 +195,7 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
                 if f.exists():
                     f.unlink()
                     rec["removed"].append(t["path"])
+            hide_stripped(wt, rec["removed"])
             # Drop directories left empty, so nothing looks half-present.
             for t in sorted({str(Path(t["path"]).parent) for t in targets}, reverse=True):
                 d = wt / t
@@ -186,7 +205,7 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
                 except OSError:
                     pass
 
-        cmd, use_shell = build_command(model, runner, no_hooks)
+        cmd, use_shell = build_command(model, runner, no_hooks, allowed_tools)
         proc = subprocess.run(
             cmd, cwd=str(wt), input=prompt, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout, shell=use_shell)
@@ -248,6 +267,9 @@ def main() -> int:
                     help="shell command for a non-Claude agent; must read the prompt on stdin")
     ap.add_argument("--out", default=None)
     ap.add_argument("--keep-worktrees", action="store_true")
+    ap.add_argument("--allowed-tools", nargs="+", default=None, metavar="RULE",
+                    help="permission rules passed to claude --allowedTools in both arms, e.g. "
+                         "'Bash(python3 -m pytest:*)' (ignored with --runner)")
     ap.add_argument("--no-hooks", action="store_true",
                     help="disable every Claude Code hook in both arms (ignored with --runner)")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, run nothing")
@@ -298,6 +320,8 @@ def main() -> int:
     print("        hooks OFF in both arms (--no-hooks): hook-injected context is not under test"
           if args.no_hooks and not args.runner else
           "        hooks ON: a hook that acts on the world fires in every run (see --no-hooks)")
+    if args.allowed_tools and not args.runner:
+        print(f"        allowed tools in both arms: {' '.join(args.allowed_tools)}")
     print("        your working tree is never touched; every run is a throwaway worktree")
     if args.dry_run:
         print("\n--dry-run: nothing executed.")
@@ -315,7 +339,7 @@ def main() -> int:
         futures = {
             pool.submit(run_one, root, sha, arm, i, prompt, targets,
                         args.model, args.runner, args.timeout, args.keep_worktrees,
-                        args.no_hooks): (arm, i)
+                        args.no_hooks, args.allowed_tools): (arm, i)
             for arm, i in jobs
         }
         for fut in concurrent.futures.as_completed(futures):

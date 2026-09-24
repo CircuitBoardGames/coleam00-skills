@@ -85,3 +85,40 @@ def test_a_linked_worktree_excludes_through_the_common_git_dir(tmp_path):
     out.mkdir(parents=True)
     assert ra.exclude_results(wt, out) == "/.ablation/"
     assert "/.ablation/" in (root / ".git/info/exclude").read_text().splitlines()
+
+
+def test_allowed_tools_reach_claude_as_one_variadic_flag(claude_on_path):
+    cmd, _ = ra.build_command("m", None, allowed_tools=["Bash(python3 -m pytest:*)", "Bash(sh -n:*)"])
+    i = cmd.index("--allowedTools")
+    assert cmd[i + 1:i + 3] == ["Bash(python3 -m pytest:*)", "Bash(sh -n:*)"]
+    assert cmd[i + 3] == "--model"  # a flag ends the variadic list
+
+
+def _committed_repo(tmp_path: Path) -> Path:
+    root = _repo(tmp_path)
+    (root / "CLAUDE.md").write_text("rules\n")
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "PATH": "/usr/bin:/bin"}
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "init"], check=True, env=env)
+    return root
+
+
+def test_a_stripped_file_is_absent_from_status_and_from_the_captured_diff(tmp_path):
+    root = _committed_repo(tmp_path)
+    (root / "CLAUDE.md").unlink()
+    ra.hide_stripped(root, ["CLAUDE.md"])
+    (root / "new.py").write_text("x = 1\n")
+    status = ra.git(["status", "--porcelain"], root)
+    assert "CLAUDE.md" not in status and "new.py" in status
+    ra.git(["add", "-A"], root)
+    diff = ra.git(["diff", "--cached", "--name-only"], root).split()
+    assert diff == ["new.py"]
+
+
+def test_without_hiding_the_deletion_leaks_into_the_diff__control(tmp_path):
+    """PASSES ON BASE: the leak the fix removes, shown so the test above cannot pass vacuously."""
+    root = _committed_repo(tmp_path)
+    (root / "CLAUDE.md").unlink()
+    ra.git(["add", "-A"], root)
+    assert "CLAUDE.md" in ra.git(["diff", "--cached", "--name-only"], root).split()
