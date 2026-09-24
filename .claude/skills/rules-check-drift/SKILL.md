@@ -17,8 +17,14 @@ rules file against what just changed and proposes the **smallest** edit that kee
 ## Input
 - `$ARGUMENTS` — optional diff range. Default: uncommitted + staged (`git diff HEAD`); fall back to `main...HEAD`.
 - **Scope: the project's rules file(s)** — `CLAUDE.md` and/or `AGENTS.md`, the root file + any package-level
-  ones. (If `CLAUDE.md` is just a `@AGENTS.md` import, check `AGENTS.md`.) Ignore README, `docs/`, and `.claude/`
-  agent/command/skill files. This skill exists to keep the *rules* honest, nothing else.
+  ones, **and `.claude/CLAUDE.md`** (Claude Code loads it exactly like a root `CLAUDE.md`, and some projects keep
+  only that one). (If `CLAUDE.md` is just a `@AGENTS.md` import, check `AGENTS.md`.) **Also path-scoped rule
+  files — `.claude/rules/*.md`, `.cursor/rules/*`** — when the diff touches a path their `paths:`/`globs:`
+  frontmatter names (or they have none, and so load always): they are rules, delivered on demand. Ignore
+  README, `docs/`, and `.claude/` agent/command/skill files. This skill exists to keep the *rules* honest,
+  nothing else.
+- **If none of those files exists, say so and stop.** "No rules file found" is a finding; "still accurate"
+  over zero files is a clean report that checked nothing.
 
 ## Process
 
@@ -27,7 +33,7 @@ rules file against what just changed and proposes the **smallest** edit that kee
 and any new invariant the change establishes.
 
 ### 2. Read the rules file as it is now
-Load the project's rules file — `CLAUDE.md` or `AGENTS.md` (and any package-scoped ones). Hold each claim against the change set.
+Load the project's rules file(s) in scope above: `CLAUDE.md` or `AGENTS.md`, `.claude/CLAUDE.md`, any package-scoped ones, and the path-scoped rule files the diff reaches. Name every file you read in the report. Hold each claim against the change set.
 
 ### 3. Flag ONLY these three things
 1. **A stated rule or fact is now false** — e.g. "routes live in `src/routes/`" but they moved. → fix it.
@@ -65,6 +71,6 @@ If nothing drifted: **"The rules file is still accurate for these changes — no
 
 ## Rules
 - **Advisory.** Report the drift; only apply/piv-commit edits if the caller explicitly asks.
-- **Rules file only** (`CLAUDE.md` / `AGENTS.md`). Not README, not docs.
+- **Rules files only** (`CLAUDE.md` / `AGENTS.md` / `.claude/CLAUDE.md` / path-scoped rule files). Not README, not docs.
 - **Lean by default.** When in doubt, suggest nothing.
 - **Run it before every merge** (or as part of `/piv-review-changes`) so your rules never drift behind the code.

@@ -81,7 +81,12 @@ python <skill>/scripts/run_ablation.py <repo> --task-file <task.md> --runs 2
 
 This is the whole experiment. It builds a fresh worktree per run, strips the layer
 in the stripped arm, runs the same prompt in each, captures every diff, cleans up
-every worktree, and writes results to `.ablation/<timestamp>/` (gitignored).
+every worktree, and writes results to `.ablation/<timestamp>/`, kept out of `git status` through
+the repo-local `.git/info/exclude` (never an edit to the tracked `.gitignore`).
+
+**Hooks run in both arms by default.** If any hook acts on the world rather than only guarding the
+session (merges, deploys, notifies, spends), pass `--no-hooks`: it disables every hook in both arms.
+That also removes context a hook injects, so the report must say hook-delivered rules were not under test.
 
 Useful flags: `--runs 3` when the user intends to act on the result, `--scope all`
 to test the harder claim that skills and subagents have expired too, `--model`,

@@ -105,10 +105,21 @@ def build_dependencies(root: Path, targets: list[dict]) -> list[str]:
 
 # ---------------------------------------------------------------- one run
 
-def build_command(model: str | None, runner: str | None) -> tuple[list[str] | str, bool]:
+# Handed to `claude --settings` by --no-hooks. Flag settings outrank every settings file.
+NO_HOOKS_SETTINGS = '{"disableAllHooks": true}'
+
+
+def build_command(model: str | None, runner: str | None,
+                  no_hooks: bool = False) -> tuple[list[str] | str, bool]:
     """Returns (command, use_shell). The prompt always arrives on stdin, never in
     argv: Windows caps a command line at 32,767 chars and a real probe task plus
-    its context blows through that as a misleading 'file not found'."""
+    its context blows through that as a misleading 'file not found'.
+
+    `no_hooks` turns every hook off in BOTH arms. Use it when the repo's hooks act
+    on the world (merge, deploy, notify, spend) rather than only guard the session:
+    a throwaway run must not do what a real session's Stop hook does. It is also a
+    measurement change, so say so in the report: context a hook injects (a
+    SessionStart loader, a PreToolUse reminder) is gone from the control arm too."""
     if runner:
         return runner, True
     exe = shutil.which("claude")
@@ -117,14 +128,40 @@ def build_command(model: str | None, runner: str | None) -> tuple[list[str] | st
             "`claude` is not on PATH. Install Claude Code, or pass --runner with the "
             "headless command for your agent (it must read the prompt on stdin).")
     cmd = [exe, "-p", "--output-format", "json", "--permission-mode", "acceptEdits"]
+    if no_hooks:
+        cmd += ["--settings", NO_HOOKS_SETTINGS]
     if model:
         cmd += ["--model", model]
     return cmd, False
 
 
+def exclude_results(root: Path, out: Path) -> str | None:
+    """Keep the results directory out of `git status` without editing a tracked file.
+
+    Appending to `.gitignore` would dirty the very tree the user asked us never to
+    touch, and a shared or protected checkout may forbid that edit outright. The
+    repo-local exclude file does the same job untracked. Nothing is written when
+    `out` lies outside the repo. Returns the pattern added, or None."""
+    try:
+        rel = out.resolve().relative_to(root.resolve())
+    except ValueError:
+        return None
+    pattern = f"/{rel.parts[0]}/"
+    exclude = Path(git(["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"],
+                       root).strip())
+    existing = exclude.read_text(encoding="utf-8", errors="replace") if exclude.exists() else ""
+    if pattern in existing.splitlines():
+        return None
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a", encoding="utf-8") as fh:
+        fh.write(("" if not existing or existing.endswith("\n") else "\n")
+                 + "# ablate-ai-layer experiment artifacts\n" + pattern + "\n")
+    return pattern
+
+
 def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
             targets: list[dict], model: str | None, runner: str | None,
-            timeout: int, keep: bool) -> dict:
+            timeout: int, keep: bool, no_hooks: bool = False) -> dict:
     """One worktree, one agent session, one diff. Fresh worktree per run so runs
     never compound on each other."""
     tmp = Path(tempfile.mkdtemp(prefix=f"ablate-{arm}-{index}-"))
@@ -149,7 +186,7 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
                 except OSError:
                     pass
 
-        cmd, use_shell = build_command(model, runner)
+        cmd, use_shell = build_command(model, runner, no_hooks)
         proc = subprocess.run(
             cmd, cwd=str(wt), input=prompt, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout, shell=use_shell)
@@ -211,6 +248,8 @@ def main() -> int:
                     help="shell command for a non-Claude agent; must read the prompt on stdin")
     ap.add_argument("--out", default=None)
     ap.add_argument("--keep-worktrees", action="store_true")
+    ap.add_argument("--no-hooks", action="store_true",
+                    help="disable every Claude Code hook in both arms (ignored with --runner)")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, run nothing")
     args = ap.parse_args()
 
@@ -256,6 +295,9 @@ def main() -> int:
     print(f"\nplan    {args.runs} control + {args.runs} stripped = {total} agent runs, "
           f"{args.jobs} at a time")
     print(f"        model {args.model or '(session default)'}, timeout {args.timeout}s each")
+    print("        hooks OFF in both arms (--no-hooks): hook-injected context is not under test"
+          if args.no_hooks and not args.runner else
+          "        hooks ON: a hook that acts on the world fires in every run (see --no-hooks)")
     print("        your working tree is never touched; every run is a throwaway worktree")
     if args.dry_run:
         print("\n--dry-run: nothing executed.")
@@ -264,10 +306,7 @@ def main() -> int:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out = Path(args.out) if args.out else root / ".ablation" / stamp
     out.mkdir(parents=True, exist_ok=True)
-    gi = root / ".gitignore"
-    if not gi.exists() or ".ablation" not in gi.read_text(encoding="utf-8", errors="replace"):
-        with gi.open("a", encoding="utf-8") as fh:
-            fh.write("\n# ablate-ai-layer experiment artifacts\n.ablation/\n")
+    exclude_results(root, out)
 
     jobs = [(arm, i) for arm in (CONTROL, STRIPPED) for i in range(1, args.runs + 1)]
     print(f"\nrunning {total} sessions, writing to {out}\n")
@@ -275,7 +314,8 @@ def main() -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         futures = {
             pool.submit(run_one, root, sha, arm, i, prompt, targets,
-                        args.model, args.runner, args.timeout, args.keep_worktrees): (arm, i)
+                        args.model, args.runner, args.timeout, args.keep_worktrees,
+                        args.no_hooks): (arm, i)
             for arm, i in jobs
         }
         for fut in concurrent.futures.as_completed(futures):
