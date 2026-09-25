@@ -27,6 +27,8 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -109,10 +111,69 @@ def build_dependencies(root: Path, targets: list[dict]) -> list[str]:
 NO_HOOKS_SETTINGS = '{"disableAllHooks": true}'
 
 
+def run_settings(no_hooks: bool = False, hooks_only: str | None = None,
+                 memory_dir: Path | None = None) -> dict:
+    """The one settings object every Claude arm gets through `--settings`.
+
+    `crossSessionInbound: refuse` is unconditional. Every `claude` process, `-p` included,
+    binds a peer socket that `disableAllHooks` does not touch, and on a box where other
+    sessions broadcast, a message can land mid-run and even replace the final result.
+    `autoMemoryDirectory` points both arms at a per-run COPY of the real memory directory:
+    both still load the same MEMORY.md, and neither can write to the real one."""
+    settings: dict = {}
+    if no_hooks:
+        settings.update(json.loads(NO_HOOKS_SETTINGS))
+    elif hooks_only:
+        settings.update(json.loads(Path(hooks_only).read_text(encoding="utf-8")))
+    settings["crossSessionInbound"] = "refuse"
+    if memory_dir is not None:
+        settings["autoMemoryDirectory"] = str(memory_dir)
+    return settings
+
+
+def claude_config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def project_slug(path: Path) -> str:
+    """How Claude Code names a project's directory under <config>/projects/."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def scratch_memory(root: Path, tmp: Path) -> Path:
+    """A per-run copy of the memory directory the repo's sessions really use.
+
+    A linked worktree shares its main checkout's memory directory, so the source is keyed
+    on the main checkout (the common git dir's parent), not on `root` or the run's tree."""
+    common = Path(git(["rev-parse", "--path-format=absolute", "--git-common-dir"], root).strip())
+    src = claude_config_dir() / "projects" / project_slug(common.parent) / "memory"
+    dst = tmp / "memory"
+    if src.is_dir():
+        shutil.copytree(src, dst)
+    else:
+        dst.mkdir(parents=True)
+    return dst
+
+
+def cross_session_messages(session_id: str | None) -> int | None:
+    """How many peer messages reached this session, read from its own transcript.
+
+    The result text alone misses a message that arrived mid-task and was answered in
+    passing. None means the transcript was not found, which is reported, not read as 0."""
+    if not session_id:
+        return None
+    hits = list((claude_config_dir() / "projects").glob(f"*/{session_id}.jsonl"))
+    if not hits:
+        return None
+    return sum(p.read_text(encoding="utf-8", errors="replace").count("<cross-session-message")
+               for p in hits)
+
+
 def build_command(model: str | None, runner: str | None,
                   no_hooks: bool = False,
                   allowed_tools: list[str] | None = None,
-                  hooks_only: str | None = None) -> tuple[list[str] | str, bool]:
+                  hooks_only: str | None = None,
+                  memory_dir: Path | None = None) -> tuple[list[str] | str, bool]:
     """Returns (command, use_shell). The prompt always arrives on stdin, never in
     argv: Windows caps a command line at 32,767 chars and a real probe task plus
     its context blows through that as a misleading 'file not found'.
@@ -136,10 +197,9 @@ def build_command(model: str | None, runner: str | None,
             "`claude` is not on PATH. Install Claude Code, or pass --runner with the "
             "headless command for your agent (it must read the prompt on stdin).")
     cmd = [exe, "-p", "--output-format", "json", "--permission-mode", "acceptEdits"]
-    if no_hooks:
-        cmd += ["--settings", NO_HOOKS_SETTINGS]
-    elif hooks_only:
-        cmd += ["--setting-sources", "user", "--settings", hooks_only]
+    if hooks_only and not no_hooks:
+        cmd += ["--setting-sources", "user"]
+    cmd += ["--settings", json.dumps(run_settings(no_hooks, hooks_only, memory_dir))]
     if allowed_tools:
         # acceptEdits approves edits and filesystem commands only; under -p every other Bash call
         # is a prompt nobody answers, so an agent cannot run the test it just wrote. Name the
@@ -231,7 +291,8 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
                 except OSError:
                     pass
 
-        cmd, use_shell = build_command(model, runner, no_hooks, allowed_tools, hooks_only)
+        memory = None if runner else scratch_memory(root, tmp)
+        cmd, use_shell = build_command(model, runner, no_hooks, allowed_tools, hooks_only, memory)
         proc = subprocess.run(
             cmd, cwd=str(wt), input=prompt, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout, shell=use_shell)
@@ -246,6 +307,8 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
             rec["num_turns"] = payload.get("num_turns")
             usage = payload.get("usage") or {}
             rec["output_tokens"] = usage.get("output_tokens")
+            rec["session_id"] = payload.get("session_id")
+            rec["cross_session_messages"] = cross_session_messages(rec["session_id"])
         except (json.JSONDecodeError, TypeError):
             # A non-Claude runner may print plain text. Not fatal: the diff is
             # the measurement, the transcript is only context for grading.
@@ -256,7 +319,11 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
         rec["diff"] = git(["diff", "--cached"], wt, check=False)
         rec["files_changed"] = [
             l for l in git(["diff", "--cached", "--name-only"], wt, check=False).splitlines() if l]
-        rec["ok"] = not rec.get("agent_error") and bool(rec["diff"].strip())
+        contaminated = bool(rec.get("cross_session_messages"))
+        rec["ok"] = not rec.get("agent_error") and bool(rec["diff"].strip()) and not contaminated
+        if contaminated:
+            rec["note"] = (f"CONTAMINATED: {rec['cross_session_messages']} peer message(s) in the "
+                           "transcript; discard this run")
         if not rec["diff"].strip():
             rec["note"] = "agent produced no file changes"
     except subprocess.TimeoutExpired:

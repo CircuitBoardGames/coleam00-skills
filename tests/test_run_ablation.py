@@ -22,13 +22,23 @@ def test_no_hooks_hands_claude_a_settings_flag_that_disables_every_hook(claude_o
     cmd, shell = ra.build_command(None, None, no_hooks=True)
     assert not shell
     i = cmd.index("--settings")
-    assert json.loads(cmd[i + 1]) == {"disableAllHooks": True}
+    assert json.loads(cmd[i + 1]) == {"disableAllHooks": True, "crossSessionInbound": "refuse"}
 
 
 def test_hooks_stay_on_by_default__control(claude_on_path):
-    """PASSES ON BASE: upstream's default, which the fork keeps."""
+    """Upstream's default, which the fork keeps: without --no-hooks nothing disables hooks."""
     cmd, _ = ra.build_command(None, None)
-    assert "--settings" not in cmd
+    settings = json.loads(cmd[cmd.index("--settings") + 1])
+    assert "disableAllHooks" not in settings and "--setting-sources" not in cmd
+
+
+def test_every_claude_arm_refuses_peer_messages(claude_on_path):
+    """Measured on 2.1.280 (hub#1614): a peer message reached `claude -p` with disableAllHooks on,
+    and once replaced the run's final result; with this key, 0 of 2 got through."""
+    for kw in ({}, {"no_hooks": True}):
+        cmd, _ = ra.build_command(None, None, **kw)
+        assert cmd.count("--settings") == 1
+        assert json.loads(cmd[cmd.index("--settings") + 1])["crossSessionInbound"] == "refuse"
 
 
 def test_a_custom_runner_is_passed_through_untouched():
@@ -127,9 +137,16 @@ def test_without_hiding_the_deletion_leaks_into_the_diff__control(tmp_path):
 def test_hooks_only_drops_project_settings_and_hands_claude_the_file(claude_on_path):
     """Measured on 2.1.280: with `--setting-sources user`, a project SessionStart and PreToolUse
     hook and a project-enabled plugin's SessionStart all stayed silent; a hook from --settings fired."""
-    cmd, _ = ra.build_command(None, None, hooks_only="/x/hooks.json")
+    f = Path(__file__).parent / "_hooks_only_fixture.json"
+    f.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}]}}))
+    try:
+        cmd, _ = ra.build_command(None, None, hooks_only=str(f))
+    finally:
+        f.unlink()
     i = cmd.index("--setting-sources")
-    assert cmd[i:i + 4] == ["--setting-sources", "user", "--settings", "/x/hooks.json"]
+    assert cmd[i:i + 3] == ["--setting-sources", "user", "--settings"]
+    settings = json.loads(cmd[i + 3])
+    assert settings["hooks"]["SessionStart"] and settings["crossSessionInbound"] == "refuse"
 
 
 def _patch_for(root: Path) -> Path:
@@ -158,3 +175,44 @@ def test_an_unhidden_patch_leaks_into_the_diff__control(tmp_path):
     ra.git(["apply", str(patch)], root)
     ra.git(["add", "-A"], root)
     assert "CLAUDE.md" in ra.git(["diff", "--cached", "--name-only"], root).split()
+
+
+def test_scratch_memory_copies_the_main_checkouts_memory_even_from_a_linked_worktree(tmp_path, monkeypatch):
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    root = _committed_repo(tmp_path)
+    real = cfg / "projects" / ra.project_slug(root) / "memory"
+    real.mkdir(parents=True)
+    (real / "MEMORY.md").write_text("- [a fact](a.md)\n")
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "--detach", str(wt)], check=True)
+    run_tmp = tmp_path / "run"
+    run_tmp.mkdir()
+    copy = ra.scratch_memory(wt, run_tmp)
+    assert (copy / "MEMORY.md").read_text() == "- [a fact](a.md)\n"
+    (copy / "MEMORY.md").write_text("an arm wrote this\n")
+    assert (real / "MEMORY.md").read_text() == "- [a fact](a.md)\n"  # the real one is untouched
+    cmd, _ = ra.build_command(None, None, memory_dir=copy)
+    assert json.loads(cmd[cmd.index("--settings") + 1])["autoMemoryDirectory"] == str(copy)
+
+
+def test_a_repo_with_no_memory_gets_an_empty_scratch_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+    root = _committed_repo(tmp_path)
+    run_tmp = tmp_path / "run"
+    run_tmp.mkdir()
+    copy = ra.scratch_memory(root, run_tmp)
+    assert copy.is_dir() and not any(copy.iterdir())
+
+
+def test_peer_messages_in_a_transcript_are_counted(tmp_path, monkeypatch):
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    proj = cfg / "projects" / "-tmp-ablate-stripped-1-x-repo"
+    proj.mkdir(parents=True)
+    (proj / "sid-dirty.jsonl").write_text('{"c":"<cross-session-message from=x>hi"}\n{"c":"<cross-session-message from=y>"}\n')
+    (proj / "sid-clean.jsonl").write_text('{"c":"ordinary turn"}\n')
+    assert ra.cross_session_messages("sid-dirty") == 2
+    assert ra.cross_session_messages("sid-clean") == 0   # control: a transcript that exists, clean
+    assert ra.cross_session_messages("sid-missing") is None  # not found is not 0
+    assert ra.cross_session_messages(None) is None

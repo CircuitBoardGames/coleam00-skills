@@ -84,6 +84,8 @@ in the stripped arm, runs the same prompt in each, captures every diff, cleans u
 every worktree, and writes results to `.ablation/<timestamp>/`, kept out of `git status` through
 the repo-local `.git/info/exclude` (never an edit to the tracked `.gitignore`).
 
+**Every Claude arm refuses peer messages and writes memory to a scratch copy.** The runner always passes `crossSessionInbound: refuse`: every `claude` process binds a peer socket that `--no-hooks` does not touch, and a message can land mid-run. It also passes `autoMemoryDirectory`, pointing at a per-run copy of the repo's real memory directory, so both arms load the same `MEMORY.md` and neither can write to the real one. After each run it counts peer messages in the run's transcript. A run with any is marked `CONTAMINATED` and not ok. Discard it.
+
 **Hooks run in both arms by default.** If any hook acts on the world rather than only guarding the
 session (merges, deploys, notifies, spends), pass `--no-hooks`: it disables every hook in both arms.
 That also removes context a hook injects, so the report must say hook-delivered rules were not under test.
