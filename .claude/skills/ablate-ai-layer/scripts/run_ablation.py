@@ -111,7 +111,8 @@ NO_HOOKS_SETTINGS = '{"disableAllHooks": true}'
 
 def build_command(model: str | None, runner: str | None,
                   no_hooks: bool = False,
-                  allowed_tools: list[str] | None = None) -> tuple[list[str] | str, bool]:
+                  allowed_tools: list[str] | None = None,
+                  hooks_only: str | None = None) -> tuple[list[str] | str, bool]:
     """Returns (command, use_shell). The prompt always arrives on stdin, never in
     argv: Windows caps a command line at 32,767 chars and a real probe task plus
     its context blows through that as a misleading 'file not found'.
@@ -120,7 +121,13 @@ def build_command(model: str | None, runner: str | None,
     on the world (merge, deploy, notify, spend) rather than only guard the session:
     a throwaway run must not do what a real session's Stop hook does. It is also a
     measurement change, so say so in the report: context a hook injects (a
-    SessionStart loader, a PreToolUse reminder) is gone from the control arm too."""
+    SessionStart loader, a PreToolUse reminder) is gone from the control arm too.
+
+    `hooks_only` is the other answer to the same hazard, for when hook TEXT is what is under
+    test: a settings file whose hooks are the only project or plugin hooks either arm runs.
+    `--setting-sources user` drops the project and local settings files, and the plugins they
+    enable, so a side-effecting Stop hook never loads while a guard named in the file still
+    fires. User-level settings stay, so a hook in ~/.claude/settings.json still runs."""
     if runner:
         return runner, True
     exe = shutil.which("claude")
@@ -131,6 +138,8 @@ def build_command(model: str | None, runner: str | None,
     cmd = [exe, "-p", "--output-format", "json", "--permission-mode", "acceptEdits"]
     if no_hooks:
         cmd += ["--settings", NO_HOOKS_SETTINGS]
+    elif hooks_only:
+        cmd += ["--setting-sources", "user", "--settings", hooks_only]
     if allowed_tools:
         # acceptEdits approves edits and filesystem commands only; under -p every other Bash call
         # is a prompt nobody answers, so an agent cannot run the test it just wrote. Name the
@@ -176,10 +185,25 @@ def hide_stripped(wt: Path, removed: list[str]) -> None:
         git(["update-index", "--skip-worktree", "--", *removed], wt)
 
 
+def apply_variant(wt: Path, patch: Path) -> list[str]:
+    """The variant arm: the layer stays whole and one patch changes it -- a shortened message,
+    a reworded rule -- so the two arms differ by exactly that edit instead of by the whole layer.
+
+    The patched paths are hidden the same way stripped ones are, for the same reason: otherwise
+    `git add -A` stages the patch and the captured diff labels its own arm."""
+    git(["apply", str(patch)], wt)
+    paths = [l for l in git(["diff", "--name-only"], wt).splitlines() if l]
+    # ponytail: skip-worktree hides an agent's OWN later edit to a patched file from the diff
+    # too. Patch files the task has no reason to touch (hook scripts, rules), not its sources.
+    hide_stripped(wt, paths)
+    return paths
+
+
 def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
             targets: list[dict], model: str | None, runner: str | None,
             timeout: int, keep: bool, no_hooks: bool = False,
-            allowed_tools: list[str] | None = None) -> dict:
+            allowed_tools: list[str] | None = None, hooks_only: str | None = None,
+            variant_patch: Path | None = None) -> dict:
     """One worktree, one agent session, one diff. Fresh worktree per run so runs
     never compound on each other."""
     tmp = Path(tempfile.mkdtemp(prefix=f"ablate-{arm}-{index}-"))
@@ -189,7 +213,9 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
     try:
         git(["worktree", "add", "--detach", "--quiet", str(wt), sha], root)
 
-        if arm == STRIPPED:
+        if arm == STRIPPED and variant_patch:
+            rec["patched"] = apply_variant(wt, variant_patch)
+        elif arm == STRIPPED:
             for t in targets:
                 f = wt / t["path"]
                 if f.exists():
@@ -205,7 +231,7 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
                 except OSError:
                     pass
 
-        cmd, use_shell = build_command(model, runner, no_hooks, allowed_tools)
+        cmd, use_shell = build_command(model, runner, no_hooks, allowed_tools, hooks_only)
         proc = subprocess.run(
             cmd, cwd=str(wt), input=prompt, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout, shell=use_shell)
@@ -272,8 +298,19 @@ def main() -> int:
                          "'Bash(python3 -m pytest:*)' (ignored with --runner)")
     ap.add_argument("--no-hooks", action="store_true",
                     help="disable every Claude Code hook in both arms (ignored with --runner)")
+    ap.add_argument("--hooks-only", default=None, metavar="SETTINGS_JSON",
+                    help="run ONLY the hooks in this settings file, in both arms: project and "
+                         "local settings and the plugins they enable are not loaded "
+                         "(ignored with --runner)")
+    ap.add_argument("--variant-patch", default=None, metavar="PATCH",
+                    help="the second arm applies this patch to an intact layer instead of "
+                         "stripping it, e.g. shortened hook text")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, run nothing")
     args = ap.parse_args()
+    if args.no_hooks and args.hooks_only:
+        ap.error("--no-hooks and --hooks-only both decide which hooks run; pass one")
+    hooks_only = str(Path(args.hooks_only).resolve()) if args.hooks_only else None
+    patch = Path(args.variant_patch).resolve() if args.variant_patch else None
 
     try:
         root = repo_root(Path(args.repo).resolve())
@@ -288,8 +325,15 @@ def main() -> int:
               "can detect anything; it cannot be blank.", file=sys.stderr)
         return 2
 
-    targets = layer_targets(root, args.scope)
-    if not targets:
+    targets = [] if patch else layer_targets(root, args.scope)
+    if patch:
+        check = subprocess.run(["git", "apply", "--check", str(patch)], cwd=str(root),
+                               capture_output=True, text=True)
+        if check.returncode:
+            print(f"The variant patch does not apply to {root}: {check.stderr.strip()}",
+                  file=sys.stderr)
+            return 2
+    elif not targets:
         print(f"No {args.scope}-scope AI layer artifacts under {root}.")
         print("Nothing to ablate, so there is nothing to test.")
         return 1
@@ -299,7 +343,10 @@ def main() -> int:
     print(f"base    {sha[:12]}" + ("   (WORKING TREE IS DIRTY: worktrees are built from "
                                    "HEAD, so uncommitted edits are NOT under test)"
                                    if is_dirty(root) else ""))
-    print(f"scope   {args.scope} ({len(targets)} files stripped in the stripped arm)")
+    if patch:
+        print(f"variant {patch} applied in the second arm; the layer is NOT stripped")
+    else:
+        print(f"scope   {args.scope} ({len(targets)} files stripped in the stripped arm)")
     for t in targets[:12]:
         print(f"          - {t['path']}")
     if len(targets) > 12:
@@ -317,9 +364,14 @@ def main() -> int:
     print(f"\nplan    {args.runs} control + {args.runs} stripped = {total} agent runs, "
           f"{args.jobs} at a time")
     print(f"        model {args.model or '(session default)'}, timeout {args.timeout}s each")
-    print("        hooks OFF in both arms (--no-hooks): hook-injected context is not under test"
-          if args.no_hooks and not args.runner else
-          "        hooks ON: a hook that acts on the world fires in every run (see --no-hooks)")
+    if args.runner:
+        pass
+    elif args.no_hooks:
+        print("        hooks OFF in both arms (--no-hooks): hook-injected context is not under test")
+    elif hooks_only:
+        print(f"        hooks: ONLY {hooks_only} (+ user-level hooks) in both arms")
+    else:
+        print("        hooks ON: a hook that acts on the world fires in every run (see --no-hooks)")
     if args.allowed_tools and not args.runner:
         print(f"        allowed tools in both arms: {' '.join(args.allowed_tools)}")
     print("        your working tree is never touched; every run is a throwaway worktree")
@@ -339,7 +391,7 @@ def main() -> int:
         futures = {
             pool.submit(run_one, root, sha, arm, i, prompt, targets,
                         args.model, args.runner, args.timeout, args.keep_worktrees,
-                        args.no_hooks, args.allowed_tools): (arm, i)
+                        args.no_hooks, args.allowed_tools, hooks_only, patch): (arm, i)
             for arm, i in jobs
         }
         for fut in concurrent.futures.as_completed(futures):
@@ -359,6 +411,7 @@ def main() -> int:
         "repo": str(root), "base_sha": sha, "scope": args.scope,
         "runs_per_arm": args.runs, "model": args.model,
         "prompt": prompt, "stripped_files": [t["path"] for t in targets],
+        "variant_patch": str(patch) if patch else None, "hooks_only": hooks_only,
         "build_dependency_warnings": deps,
         "runs": [{k: v for k, v in r.items() if k != "diff"} for r in records],
     }

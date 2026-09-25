@@ -1,4 +1,4 @@
-"""The fork's two changes to ablate-ai-layer's runner: --no-hooks, and results kept out of
+"""The fork's changes to ablate-ai-layer's runner: --no-hooks, --hooks-only and --variant-patch, and results kept out of
 `git status` through the repo-local exclude file instead of an edit to `.gitignore`."""
 import json
 import shutil
@@ -120,5 +120,41 @@ def test_without_hiding_the_deletion_leaks_into_the_diff__control(tmp_path):
     """PASSES ON BASE: the leak the fix removes, shown so the test above cannot pass vacuously."""
     root = _committed_repo(tmp_path)
     (root / "CLAUDE.md").unlink()
+    ra.git(["add", "-A"], root)
+    assert "CLAUDE.md" in ra.git(["diff", "--cached", "--name-only"], root).split()
+
+
+def test_hooks_only_drops_project_settings_and_hands_claude_the_file(claude_on_path):
+    """Measured on 2.1.280: with `--setting-sources user`, a project SessionStart and PreToolUse
+    hook and a project-enabled plugin's SessionStart all stayed silent; a hook from --settings fired."""
+    cmd, _ = ra.build_command(None, None, hooks_only="/x/hooks.json")
+    i = cmd.index("--setting-sources")
+    assert cmd[i:i + 4] == ["--setting-sources", "user", "--settings", "/x/hooks.json"]
+
+
+def _patch_for(root: Path) -> Path:
+    (root / "CLAUDE.md").write_text("short rules\n")
+    patch = root.parent / "short.patch"
+    patch.write_text(ra.git(["diff"], root))
+    ra.git(["checkout", "--", "CLAUDE.md"], root)
+    return patch
+
+
+def test_the_variant_patch_is_applied_and_absent_from_the_captured_diff(tmp_path):
+    root = _committed_repo(tmp_path)
+    patch = _patch_for(root)
+    assert ra.apply_variant(root, patch) == ["CLAUDE.md"]
+    assert (root / "CLAUDE.md").read_text() == "short rules\n"
+    (root / "new.py").write_text("x = 1\n")
+    assert "CLAUDE.md" not in ra.git(["status", "--porcelain"], root)
+    ra.git(["add", "-A"], root)
+    assert ra.git(["diff", "--cached", "--name-only"], root).split() == ["new.py"]
+
+
+def test_an_unhidden_patch_leaks_into_the_diff__control(tmp_path):
+    """PASSES ON BASE: the leak apply_variant hides, so the test above cannot pass vacuously."""
+    root = _committed_repo(tmp_path)
+    patch = _patch_for(root)
+    ra.git(["apply", str(patch)], root)
     ra.git(["add", "-A"], root)
     assert "CLAUDE.md" in ra.git(["diff", "--cached", "--name-only"], root).split()

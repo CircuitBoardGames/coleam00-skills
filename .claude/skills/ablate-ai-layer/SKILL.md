@@ -88,6 +88,13 @@ the repo-local `.git/info/exclude` (never an edit to the tracked `.gitignore`).
 session (merges, deploys, notifies, spends), pass `--no-hooks`: it disables every hook in both arms.
 That also removes context a hook injects, so the report must say hook-delivered rules were not under test.
 
+**To test hook TEXT, not the layer, use `--hooks-only FILE --variant-patch PATCH`.** `--hooks-only`
+runs only the hooks in that settings file, in both arms. Project and local settings, and the plugins
+they enable, are not loaded, so the guards under test fire and the side-effecting hooks do not.
+User-level hooks still run. `--variant-patch` leaves the layer whole in the second arm and applies
+the patch instead (a shortened message, a reworded rule), so the two arms differ by exactly that edit.
+Patch only files the task has no reason to edit: the patched paths are hidden from the captured diff.
+
 **Under `-p`, `acceptEdits` approves edits and filesystem commands only**: every other Bash call is a
 prompt nobody answers, so no arm can run the test it wrote, and a rule about verifying work cannot be
 exercised. Pass the commands the task needs with `--allowed-tools`, e.g.
