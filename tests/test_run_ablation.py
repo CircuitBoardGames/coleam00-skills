@@ -216,3 +216,72 @@ def test_peer_messages_in_a_transcript_are_counted(tmp_path, monkeypatch):
     assert ra.cross_session_messages("sid-clean") == 0   # control: a transcript that exists, clean
     assert ra.cross_session_messages("sid-missing") is None  # not found is not 0
     assert ra.cross_session_messages(None) is None
+
+
+def _repo_with_hooks(tmp_path: Path, commands: list[str]) -> Path:
+    root = _repo(tmp_path)
+    (root / ".claude").mkdir()
+    (root / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"SessionStart": [
+        {"hooks": [{"type": "command", "command": c} for c in commands]}]}}))
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "PATH": "/usr/bin:/bin"}
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "init"], check=True, env=env)
+    return root
+
+
+def test_cache_hooks_are_snapshotted_once_and_only_the_matching_ones(tmp_path):
+    root = _repo_with_hooks(tmp_path, ["echo HOT-PAGE # cache-inject", "echo unrelated-guard"])
+    snaps = ra.snapshot_cache_hooks(root, "cache-inject", tmp_path / "snaps")
+    assert [s.read_text() for s in snaps] == ["HOT-PAGE\n"]
+
+
+def test_no_matching_cache_hook_is_an_error_not_an_empty_strip(tmp_path):
+    root = _repo_with_hooks(tmp_path, ["echo unrelated-guard"])
+    with pytest.raises(RuntimeError, match="nothing to strip"):
+        ra.snapshot_cache_hooks(root, "cache-inject", tmp_path / "snaps")
+
+
+def test_a_cache_hook_that_prints_nothing_is_an_error(tmp_path):
+    root = _repo_with_hooks(tmp_path, ["true # cache-inject"])
+    with pytest.raises(RuntimeError, match="gave no output"):
+        ra.snapshot_cache_hooks(root, "cache-inject", tmp_path / "snaps")
+
+
+def test_each_arm_gets_its_own_project_settings_and_the_rewrite_stays_out_of_the_diff(tmp_path):
+    root = _repo_with_hooks(tmp_path, ["echo HOT-PAGE # cache-inject", "echo side-effect"])
+    snaps = ra.snapshot_cache_hooks(root, "cache-inject", tmp_path / "snaps")
+    sha = ra.head_sha(root)
+    seen = {}
+    for arm in (ra.CONTROL, ra.STRIPPED):
+        rec = ra.run_one(root, sha, arm, 1, "x", [], None, "cp .claude/settings.json seen.json", 60,
+                         False, strip_surfaces=("caches",), snapshots=snaps)
+        assert rec["files_changed"] == ["seen.json"], rec  # the rewrite itself is hidden
+        added = [l[1:] for l in rec["diff"].splitlines() if l.startswith("+") and not l.startswith("+++")]
+        seen[arm] = json.loads("".join(added))
+    hooks = [h["command"] for g in seen[ra.CONTROL]["hooks"]["SessionStart"] for h in g["hooks"]]
+    assert hooks == [f"cat {snaps[0]}"]          # control: only the cache replay
+    assert seen[ra.STRIPPED] == {}                # stripped: no hooks at all
+    assert "side-effect" not in json.dumps(seen)  # the project's other hooks are gone from both
+
+
+def test_the_user_instruction_file_is_excluded_in_the_stripped_arm_only(claude_on_path, monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+    cmd, _ = ra.build_command(None, None, extra_settings={"claudeMdExcludes": [str(tmp_path / "cfg" / "CLAUDE.md")]})
+    assert json.loads(cmd[cmd.index("--settings") + 1])["claudeMdExcludes"] == [str(tmp_path / "cfg" / "CLAUDE.md")]
+    plain, _ = ra.build_command(None, None)
+    assert "claudeMdExcludes" not in json.loads(plain[plain.index("--settings") + 1])  # control
+
+
+@pytest.mark.parametrize("extra, says", [
+    (["--no-hooks"], "would silence it in the control arm"),
+    (["--variant-patch", "x.patch"], "cannot combine with --hooks-only or --variant-patch"),
+    (["--hooks-only", "h.json"], "cannot combine with --hooks-only or --variant-patch"),
+])
+def test_strip_surface_refuses_modes_that_would_silence_or_replace_it(tmp_path, extra, says):
+    task = tmp_path / "task.md"
+    task.write_text("do a thing")
+    out = subprocess.run([sys.executable, str(SCRIPTS / "run_ablation.py"), str(tmp_path), "--task-file",
+                          str(task), "--strip-surface", "caches", *extra, "--dry-run"],
+                         capture_output=True, text=True)
+    assert out.returncode == 2 and says in " ".join(out.stderr.split())  # argparse wraps lines

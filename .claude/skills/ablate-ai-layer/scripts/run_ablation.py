@@ -29,6 +29,7 @@ import concurrent.futures
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from map_layer import ALWAYS, ONDEMAND, iter_matches  # noqa: E402
 
 CONTROL, STRIPPED = "control", "stripped"
+# Always-loaded surfaces that live OUTSIDE the repo layer, strippable one arm at a time.
+SURFACES = ("user-claude-md", "memory", "caches")
 
 
 # ---------------------------------------------------------------- git plumbing
@@ -112,7 +115,7 @@ NO_HOOKS_SETTINGS = '{"disableAllHooks": true}'
 
 
 def run_settings(no_hooks: bool = False, hooks_only: str | None = None,
-                 memory_dir: Path | None = None) -> dict:
+                 memory_dir: Path | None = None, extra: dict | None = None) -> dict:
     """The one settings object every Claude arm gets through `--settings`.
 
     `crossSessionInbound: refuse` is unconditional. Every `claude` process, `-p` included,
@@ -128,7 +131,47 @@ def run_settings(no_hooks: bool = False, hooks_only: str | None = None,
     settings["crossSessionInbound"] = "refuse"
     if memory_dir is not None:
         settings["autoMemoryDirectory"] = str(memory_dir)
+    settings.update(extra or {})
     return settings
+
+
+def snapshot_cache_hooks(root: Path, match: str, outdir: Path) -> list[Path]:
+    """Run each project SessionStart hook whose command contains `match` ONCE, and keep its output.
+
+    The control arm replays these snapshots with `cat`, so every control run sees the same
+    injected text even if the live source (a wiki page, say) changes mid-experiment. Finding no
+    hook is an error, not an empty strip: stripping nothing would report the caches as redundant."""
+    settings = json.loads((root / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    commands = [h["command"] for g in settings.get("hooks", {}).get("SessionStart", [])
+                for h in g.get("hooks", []) if match in h.get("command", "")]
+    if not commands:
+        raise RuntimeError(f"no project SessionStart hook command contains {match!r}; nothing to strip")
+    outdir.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(root)}
+    event = json.dumps({"hook_event_name": "SessionStart", "source": "startup"})
+    snaps = []
+    for n, command in enumerate(commands, 1):
+        out = subprocess.run(command, shell=True, cwd=str(root), env=env, input=event,
+                             capture_output=True, text=True, timeout=120)
+        if out.returncode or not out.stdout.strip():
+            raise RuntimeError(f"cache hook {n} gave no output (exit {out.returncode}): {command}")
+        f = outdir / f"cache-hook-{n}.txt"
+        f.write_text(out.stdout, encoding="utf-8")
+        snaps.append(f)
+    return snaps
+
+
+def surface_project_settings(arm: str, snapshots: list[Path]) -> dict:
+    """The throwaway worktree's .claude/settings.json when the caches are under test.
+
+    Both arms lose every other project hook and project-enabled plugin (their side effects are
+    the hazard --no-hooks exists for); only the control arm replays the cache snapshots.
+    Project settings stay a live source, which is what keeps AGENTS.md/CLAUDE.md loading:
+    `--setting-sources user` stops them (measured on Opus, claude 2.1.280)."""
+    if arm != CONTROL:
+        return {}
+    return {"hooks": {"SessionStart": [{"hooks": [
+        {"type": "command", "command": f"cat {shlex.quote(str(f))}"} for f in snapshots]}]}}
 
 
 def claude_config_dir() -> Path:
@@ -173,7 +216,8 @@ def build_command(model: str | None, runner: str | None,
                   no_hooks: bool = False,
                   allowed_tools: list[str] | None = None,
                   hooks_only: str | None = None,
-                  memory_dir: Path | None = None) -> tuple[list[str] | str, bool]:
+                  memory_dir: Path | None = None,
+                  extra_settings: dict | None = None) -> tuple[list[str] | str, bool]:
     """Returns (command, use_shell). The prompt always arrives on stdin, never in
     argv: Windows caps a command line at 32,767 chars and a real probe task plus
     its context blows through that as a misleading 'file not found'.
@@ -199,7 +243,7 @@ def build_command(model: str | None, runner: str | None,
     cmd = [exe, "-p", "--output-format", "json", "--permission-mode", "acceptEdits"]
     if hooks_only and not no_hooks:
         cmd += ["--setting-sources", "user"]
-    cmd += ["--settings", json.dumps(run_settings(no_hooks, hooks_only, memory_dir))]
+    cmd += ["--settings", json.dumps(run_settings(no_hooks, hooks_only, memory_dir, extra_settings))]
     if allowed_tools:
         # acceptEdits approves edits and filesystem commands only; under -p every other Bash call
         # is a prompt nobody answers, so an agent cannot run the test it just wrote. Name the
@@ -263,7 +307,8 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
             targets: list[dict], model: str | None, runner: str | None,
             timeout: int, keep: bool, no_hooks: bool = False,
             allowed_tools: list[str] | None = None, hooks_only: str | None = None,
-            variant_patch: Path | None = None) -> dict:
+            variant_patch: Path | None = None, strip_surfaces: tuple = (),
+            snapshots: list[Path] | None = None) -> dict:
     """One worktree, one agent session, one diff. Fresh worktree per run so runs
     never compound on each other."""
     tmp = Path(tempfile.mkdtemp(prefix=f"ablate-{arm}-{index}-"))
@@ -273,7 +318,18 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
     try:
         git(["worktree", "add", "--detach", "--quiet", str(wt), sha], root)
 
-        if arm == STRIPPED and variant_patch:
+        extra: dict = {}
+        if strip_surfaces:
+            # The repo layer stays whole in both arms; only the named outside surfaces move.
+            if "caches" in strip_surfaces:
+                (wt / ".claude").mkdir(exist_ok=True)
+                (wt / ".claude" / "settings.json").write_text(
+                    json.dumps(surface_project_settings(arm, snapshots or [])), encoding="utf-8")
+                hide_stripped(wt, [".claude/settings.json"])
+            if "user-claude-md" in strip_surfaces and arm == STRIPPED:
+                extra["claudeMdExcludes"] = [str(claude_config_dir() / "CLAUDE.md")]
+            rec["stripped_surfaces"] = list(strip_surfaces) if arm == STRIPPED else []
+        elif arm == STRIPPED and variant_patch:
             rec["patched"] = apply_variant(wt, variant_patch)
         elif arm == STRIPPED:
             for t in targets:
@@ -292,7 +348,10 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
                     pass
 
         memory = None if runner else scratch_memory(root, tmp)
-        cmd, use_shell = build_command(model, runner, no_hooks, allowed_tools, hooks_only, memory)
+        if memory is not None and "memory" in strip_surfaces and arm == STRIPPED:
+            (memory / "MEMORY.md").unlink(missing_ok=True)
+        cmd, use_shell = build_command(model, runner, no_hooks, allowed_tools, hooks_only, memory,
+                                       extra)
         proc = subprocess.run(
             cmd, cwd=str(wt), input=prompt, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout, shell=use_shell)
@@ -372,10 +431,23 @@ def main() -> int:
     ap.add_argument("--variant-patch", default=None, metavar="PATCH",
                     help="the second arm applies this patch to an intact layer instead of "
                          "stripping it, e.g. shortened hook text")
+    ap.add_argument("--strip-surface", nargs="+", default=[], choices=SURFACES, metavar="SURFACE",
+                    help="strip always-loaded surfaces that live OUTSIDE the repo in the second arm "
+                         f"({', '.join(SURFACES)}); the repo layer stays whole in both arms")
+    ap.add_argument("--cache-hook-match", default="cache-inject", metavar="TEXT",
+                    help="with --strip-surface caches: the project SessionStart hooks whose command "
+                         "contains TEXT are the caches (default: cache-inject)")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, run nothing")
     args = ap.parse_args()
     if args.no_hooks and args.hooks_only:
         ap.error("--no-hooks and --hooks-only both decide which hooks run; pass one")
+    strip_surfaces = tuple(dict.fromkeys(args.strip_surface))
+    if strip_surfaces and (args.hooks_only or args.variant_patch):
+        ap.error("--strip-surface decides what the second arm lacks; it cannot combine with "
+                 "--hooks-only or --variant-patch")
+    if "caches" in strip_surfaces and args.no_hooks:
+        ap.error("--strip-surface caches replays the caches through a hook; --no-hooks would silence "
+                 "it in the control arm too (both arms already lose every other project hook)")
     hooks_only = str(Path(args.hooks_only).resolve()) if args.hooks_only else None
     patch = Path(args.variant_patch).resolve() if args.variant_patch else None
 
@@ -392,7 +464,7 @@ def main() -> int:
               "can detect anything; it cannot be blank.", file=sys.stderr)
         return 2
 
-    targets = [] if patch else layer_targets(root, args.scope)
+    targets = [] if (patch or strip_surfaces) else layer_targets(root, args.scope)
     if patch:
         check = subprocess.run(["git", "apply", "--check", str(patch)], cwd=str(root),
                                capture_output=True, text=True)
@@ -400,7 +472,7 @@ def main() -> int:
             print(f"The variant patch does not apply to {root}: {check.stderr.strip()}",
                   file=sys.stderr)
             return 2
-    elif not targets:
+    elif not targets and not strip_surfaces:
         print(f"No {args.scope}-scope AI layer artifacts under {root}.")
         print("Nothing to ablate, so there is nothing to test.")
         return 1
@@ -412,6 +484,11 @@ def main() -> int:
                                    if is_dirty(root) else ""))
     if patch:
         print(f"variant {patch} applied in the second arm; the layer is NOT stripped")
+    elif strip_surfaces:
+        print(f"strip   {', '.join(strip_surfaces)} in the second arm; the repo layer stays whole in both")
+        if "caches" in strip_surfaces:
+            print(f"        caches = project SessionStart hooks matching {args.cache_hook_match!r}, "
+                  "snapshotted once; every other project hook and plugin is off in both arms")
     else:
         print(f"scope   {args.scope} ({len(targets)} files stripped in the stripped arm)")
     for t in targets[:12]:
@@ -437,6 +514,10 @@ def main() -> int:
         print("        hooks OFF in both arms (--no-hooks): hook-injected context is not under test")
     elif hooks_only:
         print(f"        hooks: ONLY {hooks_only} (+ user-level hooks) in both arms")
+        print("        NOTE: --setting-sources user also stops the project's AGENTS.md/CLAUDE.md "
+              "loading in BOTH arms (measured on Opus, claude 2.1.280)")
+    elif "caches" in strip_surfaces:
+        print("        hooks: only the cache snapshots, control arm only (+ user-level hooks)")
     else:
         print("        hooks ON: a hook that acts on the world fires in every run (see --no-hooks)")
     if args.allowed_tools and not args.runner:
@@ -450,6 +531,8 @@ def main() -> int:
     out = Path(args.out) if args.out else root / ".ablation" / stamp
     out.mkdir(parents=True, exist_ok=True)
     exclude_results(root, out)
+    snapshots = (snapshot_cache_hooks(root, args.cache_hook_match, out / "cache-snapshots")
+                 if "caches" in strip_surfaces else None)
 
     jobs = [(arm, i) for arm in (CONTROL, STRIPPED) for i in range(1, args.runs + 1)]
     print(f"\nrunning {total} sessions, writing to {out}\n")
@@ -458,7 +541,8 @@ def main() -> int:
         futures = {
             pool.submit(run_one, root, sha, arm, i, prompt, targets,
                         args.model, args.runner, args.timeout, args.keep_worktrees,
-                        args.no_hooks, args.allowed_tools, hooks_only, patch): (arm, i)
+                        args.no_hooks, args.allowed_tools, hooks_only, patch,
+                        strip_surfaces, snapshots): (arm, i)
             for arm, i in jobs
         }
         for fut in concurrent.futures.as_completed(futures):

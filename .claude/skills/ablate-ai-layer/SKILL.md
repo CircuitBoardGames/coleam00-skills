@@ -90,6 +90,15 @@ the repo-local `.git/info/exclude` (never an edit to the tracked `.gitignore`).
 session (merges, deploys, notifies, spends), pass `--no-hooks`: it disables every hook in both arms.
 That also removes context a hook injects, so the report must say hook-delivered rules were not under test.
 
+**To ablate an always-loaded surface that lives OUTSIDE the repo, use `--strip-surface`** with any of `user-claude-md` (`~/.claude/CLAUDE.md`), `memory` (`MEMORY.md`) and `caches` (text that project SessionStart hooks inject; `--cache-hook-match` picks the hooks, default `cache-inject`). The repo layer stays whole in both arms, and only the named surfaces are missing from the second.
+- `user-claude-md` passes `claudeMdExcludes` to that arm.
+- `memory` removes `MEMORY.md` from that arm's scratch memory copy.
+- `caches` snapshots the matching hooks' output once. Each arm's `.claude/settings.json` is rewritten: the control arm replays the snapshots, the stripped arm gets no hooks, and both lose every other project hook and plugin.
+
+It refuses `--no-hooks`, `--hooks-only` and `--variant-patch`. Measured on Opus (claude 2.1.280) and end to end: `AGENTS.md` loads in both arms, and each surface is present in one arm and absent in the other.
+
+**`--hooks-only` stops the project's `AGENTS.md`/`CLAUDE.md` loading in BOTH arms.** `--setting-sources user` drops project instructions along with project settings (measured on Opus, claude 2.1.280). Use it only when the instruction files are not part of what you are comparing.
+
 **To test hook TEXT, not the layer, use `--hooks-only FILE --variant-patch PATCH`.** `--hooks-only`
 runs only the hooks in that settings file, in both arms. Project and local settings, and the plugins
 they enable, are not loaded, so the guards under test fire and the side-effecting hooks do not.
