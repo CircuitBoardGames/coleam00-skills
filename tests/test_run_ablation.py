@@ -210,10 +210,21 @@ def test_peer_messages_in_a_transcript_are_counted(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
     proj = cfg / "projects" / "-tmp-ablate-stripped-1-x-repo"
     proj.mkdir(parents=True)
-    (proj / "sid-dirty.jsonl").write_text('{"c":"<cross-session-message from=x>hi"}\n{"c":"<cross-session-message from=y>"}\n')
-    (proj / "sid-clean.jsonl").write_text('{"c":"ordinary turn"}\n')
-    assert ra.cross_session_messages("sid-dirty") == 2
-    assert ra.cross_session_messages("sid-clean") == 0   # control: a transcript that exists, clean
+    tag = '<cross-session-message from="uds:/tmp/x.sock">hi</cross-session-message>'
+    idle = {"type": "user", "message": {"role": "user", "content": tag}}
+    busy = {"type": "attachment", "attachment": {"type": "queued_command", "prompt": tag + tag}}
+    (proj / "sid-dirty.jsonl").write_text("\n".join(json.dumps(e) for e in (idle, busy)) + "\n")
+    # The shapes a CLEAN run carries the tag in (hub#1618): the agent reading run_ablation.py, its
+    # tool call quoting it, the queue's bookkeeping, and the SendMessage docs.
+    read = {"type": "user", "message": {"role": "user",
+                                        "content": [{"type": "tool_result", "content": tag}]}}
+    call = {"type": "assistant", "message": {"content": [{"type": "tool_use", "input": {"q": tag}}]}}
+    queue = {"type": "queue-operation", "operation": "enqueue", "content": tag}
+    docs = {"type": "attachment", "attachment": {"type": "deferred_tools_record", "text": tag}}
+    (proj / "sid-clean.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in (read, call, queue, docs)) + "\n")
+    assert ra.cross_session_messages("sid-dirty") == 2   # one per DELIVERY, not per substring
+    assert ra.cross_session_messages("sid-clean") == 0   # the tag present, nothing delivered
     assert ra.cross_session_messages("sid-missing") is None  # not found is not 0
     assert ra.cross_session_messages(None) is None
 

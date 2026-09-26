@@ -202,14 +202,31 @@ def cross_session_messages(session_id: str | None) -> int | None:
     """How many peer messages reached this session, read from its own transcript.
 
     The result text alone misses a message that arrived mid-task and was answered in
-    passing. None means the transcript was not found, which is reported, not read as 0."""
+    passing. None means the transcript was not found, which is reported, not read as 0.
+
+    Counts DELIVERIES, one per entry: a user turn whose content is a string (arrived idle) or a
+    `queued_command` attachment (arrived mid-turn). A substring count flagged clean runs: the tag
+    also appears in tool results (an agent that read this file), tool calls, queue bookkeeping and
+    the SendMessage tool's own docs -- measured on hub#1618, two of six runs falsely CONTAMINATED."""
     if not session_id:
         return None
     hits = list((claude_config_dir() / "projects").glob(f"*/{session_id}.jsonl"))
     if not hits:
         return None
-    return sum(p.read_text(encoding="utf-8", errors="replace").count("<cross-session-message")
-               for p in hits)
+    n = 0
+    for p in hits:
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "<cross-session-message" not in line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if (e.get("type") == "user" and isinstance((e.get("message") or {}).get("content"), str)
+                    or e.get("type") == "attachment"
+                    and (e.get("attachment") or {}).get("type") == "queued_command"):
+                n += 1
+    return n
 
 
 def build_command(model: str | None, runner: str | None,
