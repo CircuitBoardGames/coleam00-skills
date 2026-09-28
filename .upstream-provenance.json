@@ -1,0 +1,6 @@
+{
+  "true_upstream": "https://github.com/coleam00/skills",
+  "true_upstream_branch": "main",
+  "last_synced_upstream_sha": "dfaa9105741fc5ba9b16b6a72551cad4bad70415",
+  "note": "Provenance marker for the CircuitBoardGames/ClaudeCode maintainer agent's P2 vendor-sync drift check (docs/agents/maintainer.md Part A.6a). last_synced_upstream_sha is this fork's merge-base with true_upstream (dfaa9105, upstream main at seeding; 0 upstream commits past it); advance it in each true-upstream->fork sync PR. Seeded 2026-09-28 (hub#1648). The fork's divergence is under .claude/skills/ablate-ai-layer and .claude/skills/rules-check-drift (fork PRs #1-#5 and later: --no-hooks, --allowed-tools, --hooks-only, --variant-patch, --strip-surface, peer-message refusal, the AGENTS.md-aware drift check), plus tests/ and .forgejo/, the forge gate; upstream syncs merge around them."
+}
