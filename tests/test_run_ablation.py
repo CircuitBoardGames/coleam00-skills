@@ -296,3 +296,16 @@ def test_strip_surface_refuses_modes_that_would_silence_or_replace_it(tmp_path, 
                           str(task), "--strip-surface", "caches", *extra, "--dry-run"],
                          capture_output=True, text=True)
     assert out.returncode == 2 and says in " ".join(out.stderr.split())  # argparse wraps lines
+
+
+def test_the_final_message_is_kept_whole_for_grading(tmp_path):
+    """A task graded on the final message was graded on a fragment: result_text was cut at 4000
+    characters, and every routing answer of hub#1618's task A came after the cut."""
+    root = _committed_repo(tmp_path)
+    sha = ra.head_sha(root)
+    long = "x" * 5000 + "END"
+    runner = "printf '%%s' '%s'" % json.dumps({"result": long, "session_id": None})
+    rec = ra.run_one(root, sha, ra.CONTROL, 1, "x", [], None, runner, 60, False)
+    assert rec["result_text"] == long, len(rec["result_text"])
+    rec = ra.run_one(root, sha, ra.CONTROL, 2, "x", [], None, "printf '%s'" % long, 60, False)
+    assert rec["result_text"] == long, len(rec["result_text"])   # a plain-text runner too

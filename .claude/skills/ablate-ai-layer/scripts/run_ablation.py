@@ -378,7 +378,7 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
         try:
             payload = json.loads(proc.stdout)
             rec["agent_error"] = bool(payload.get("is_error"))
-            rec["result_text"] = str(payload.get("result", ""))[:4000]
+            rec["result_text"] = str(payload.get("result", ""))
             rec["cost_usd"] = payload.get("total_cost_usd")
             rec["num_turns"] = payload.get("num_turns")
             usage = payload.get("usage") or {}
@@ -388,7 +388,7 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
         except (json.JSONDecodeError, TypeError):
             # A non-Claude runner may print plain text. Not fatal: the diff is
             # the measurement, the transcript is only context for grading.
-            rec["result_text"] = (proc.stdout or "")[:4000]
+            rec["result_text"] = proc.stdout or ""
             rec["agent_error"] = proc.returncode != 0
 
         git(["add", "-A"], wt, check=False)
