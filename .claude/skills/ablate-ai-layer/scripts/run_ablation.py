@@ -6,9 +6,9 @@ stripped, in throwaway git worktrees, and collects the resulting diffs for gradi
 
 Two properties make this safe to run unattended:
 
-  * Your working tree is never modified. Every run happens in a detached worktree
-    created from HEAD in a temp directory and deleted afterwards. Nothing is moved
-    aside, so there is no restore step that can fail and leave you stripped.
+  * Your working tree is never modified. Every run happens in a one-commit snapshot
+    of HEAD in a temp directory (no history, no refs: see `snapshot`), deleted
+    afterwards. Nothing is moved aside, so there is no restore step that can fail.
   * Worktrees live OUTSIDE the repo. An agent started inside the repo would walk
     up and find the very CLAUDE.md this script just removed.
 
@@ -320,6 +320,30 @@ def apply_variant(wt: Path, patch: Path) -> list[str]:
     return paths
 
 
+def snapshot(root: Path, sha: str, wt: Path, drop: list[str]) -> list[str]:
+    """A one-commit repo holding `sha`'s tree minus `drop`, with no history and no refs.
+
+    A linked worktree shares the source repo's objects and refs, so a stripped arm could
+    `git show HEAD:AGENTS.md` and read the layer it was stripped of, and any arm could read
+    other branches -- both measured in round 2 of hub#1618. The files come through a
+    throwaway index, so the source repo's own index is never touched, and every file in the
+    tree arrives (`git archive` would honour export-ignore)."""
+    wt.mkdir(parents=True)
+    env = dict(os.environ, GIT_INDEX_FILE=str(wt.parent / "snapshot.index"))
+    subprocess.run(["git", "read-tree", sha], cwd=str(root), env=env, check=True)
+    subprocess.run(["git", "--work-tree", str(wt), "checkout-index", "-a"], cwd=str(root),
+                   env=env, check=True)
+    Path(env["GIT_INDEX_FILE"]).unlink()
+    dropped = [p for p in drop if (wt / p).is_file() or (wt / p).is_symlink()]
+    for p in dropped:
+        (wt / p).unlink()
+    git(["init", "-q"], wt)
+    git(["add", "-A", "-f"], wt)   # -f: every file came from the tree, ignored patterns or not
+    git(["-c", "user.name=ablate", "-c", "user.email=ablate@localhost", "-c", "commit.gpgsign=false",
+         "commit", "-q", "--no-verify", "-m", "snapshot"], wt)
+    return dropped
+
+
 def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
             targets: list[dict], model: str | None, runner: str | None,
             timeout: int, keep: bool, no_hooks: bool = False,
@@ -333,7 +357,8 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
     rec: dict = {"arm": arm, "index": index, "removed": [], "ok": False}
     started = time.time()
     try:
-        git(["worktree", "add", "--detach", "--quiet", str(wt), sha], root)
+        plain_strip = arm == STRIPPED and not strip_surfaces and not variant_patch
+        rec["removed"] = snapshot(root, sha, wt, [t["path"] for t in targets] if plain_strip else [])
 
         extra: dict = {}
         if strip_surfaces:
@@ -349,12 +374,7 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
         elif arm == STRIPPED and variant_patch:
             rec["patched"] = apply_variant(wt, variant_patch)
         elif arm == STRIPPED:
-            for t in targets:
-                f = wt / t["path"]
-                if f.exists():
-                    f.unlink()
-                    rec["removed"].append(t["path"])
-            hide_stripped(wt, rec["removed"])
+            # The files were left out of the snapshot's only commit, so git never saw them.
             # Drop directories left empty, so nothing looks half-present.
             for t in sorted({str(Path(t["path"]).parent) for t in targets}, reverse=True):
                 d = wt / t
@@ -411,11 +431,7 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
         if keep:
             rec["worktree_kept"] = str(wt)
         else:
-            subprocess.run(["git", "worktree", "remove", "--force", str(wt)],
-                           cwd=str(root), capture_output=True, text=True)
             shutil.rmtree(tmp, ignore_errors=True)
-            subprocess.run(["git", "worktree", "prune"], cwd=str(root),
-                           capture_output=True, text=True)
     return rec
 
 

@@ -309,3 +309,32 @@ def test_the_final_message_is_kept_whole_for_grading(tmp_path):
     assert rec["result_text"] == long, len(rec["result_text"])
     rec = ra.run_one(root, sha, ra.CONTROL, 2, "x", [], None, "printf '%s'" % long, 60, False)
     assert rec["result_text"] == long, len(rec["result_text"])   # a plain-text runner too
+
+
+def test_an_arm_cannot_read_the_stripped_layer_or_other_refs_from_git(tmp_path):
+    """hub#1618 round 2: a stripped arm ran `git show HEAD:AGENTS.md` and read the layer it was
+    stripped of, and a control arm cited a branch in flight -- a linked worktree shares the
+    source repo's objects and refs. Each arm is now a one-commit repo with nothing else in it."""
+    root = _committed_repo(tmp_path)
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "PATH": "/usr/bin:/bin"}
+    subprocess.run(["git", "-C", str(root), "commit", "-q", "--allow-empty", "-m", "second"],
+                   check=True, env=env)
+    subprocess.run(["git", "-C", str(root), "branch", "in-flight"], check=True)
+    sha = ra.head_sha(root)
+    targets = [{"path": "CLAUDE.md"}]
+    probe = ("{ git show HEAD:CLAUDE.md 2>&1; git log --all --oneline | wc -l;"
+             " git branch -a; git status --porcelain; } > probe.txt")
+    seen = {}
+    for arm in (ra.CONTROL, ra.STRIPPED):
+        rec = ra.run_one(root, sha, arm, 1, "x", targets, None, probe, 60, False)
+        seen[arm] = "\n".join(l[1:] for l in rec["diff"].splitlines()
+                              if l.startswith("+") and not l.startswith("+++"))
+        assert rec["files_changed"] == ["probe.txt"], rec
+    assert "rules" in seen[ra.CONTROL]                # control: the layer is there
+    assert "rules" not in seen[ra.STRIPPED], seen[ra.STRIPPED]
+    for arm in seen:
+        assert "in-flight" not in seen[arm], seen[arm]  # no foreign refs in either arm
+        assert "\n1\n" in "\n" + seen[arm] + "\n", seen[arm]  # one commit, no history
+    assert (root / "CLAUDE.md").exists() and "in-flight" in subprocess.run(
+        ["git", "-C", str(root), "branch"], capture_output=True, text=True).stdout

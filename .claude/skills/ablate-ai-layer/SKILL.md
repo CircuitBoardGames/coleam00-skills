@@ -18,9 +18,10 @@ Do not hand the user a list of commands to run; the script drives both arms.
   run has nothing to compare against and "seems fine" becomes "delete something
   load-bearing". Two runs of the *same* arm can also differ more than the two arms
   differ, so one pair per arm is the floor, not the target.
-- **Nothing is moved aside.** Every run happens in a detached git worktree built
-  from HEAD in a temp directory, outside the repo, and deleted afterwards. The
-  user's working tree is never modified, so there is no restore step to forget.
+- **Nothing is moved aside.** Every run happens in a one-commit snapshot of HEAD
+  in a temp directory, outside the repo, and deleted afterwards. The snapshot has no
+  history and no refs, so a stripped arm cannot read its layer back with `git show`.
+  The user's working tree is never modified, so there is no restore step to forget.
 - **Only the always-loaded set is stripped by default.** Skills, subagents and
   path-scoped rules cost nothing until they fire, so deleting them buys back no
   context. Hooks and permissions are never touched: they run as code and spend no
