@@ -208,7 +208,7 @@ def test_a_repo_with_no_memory_gets_an_empty_scratch_dir(tmp_path, monkeypatch):
 def test_peer_messages_in_a_transcript_are_counted(tmp_path, monkeypatch):
     cfg = tmp_path / "cfg"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
-    proj = cfg / "projects" / "-tmp-ablate-stripped-1-x-repo"
+    proj = cfg / "projects" / "-tmp-ablate-run-x-repo"
     proj.mkdir(parents=True)
     tag = '<cross-session-message from="uds:/tmp/x.sock">hi</cross-session-message>'
     idle = {"type": "user", "message": {"role": "user", "content": tag}}
@@ -338,3 +338,17 @@ def test_an_arm_cannot_read_the_stripped_layer_or_other_refs_from_git(tmp_path):
         assert "\n1\n" in "\n" + seen[arm] + "\n", seen[arm]  # one commit, no history
     assert (root / "CLAUDE.md").exists() and "in-flight" in subprocess.run(
         ["git", "-C", str(root), "branch"], capture_output=True, text=True).stdout
+
+
+def test_the_working_directory_does_not_name_the_arm(tmp_path):
+    """Round 3 of the hub's AGENTS.md ablation: the temp dir was `ablate-<arm>-<n>-...`, so an
+    agent that named its working directory in its final message (three of six did) told the
+    blind grader which arm it was in. The path an arm runs in must say nothing about the arm."""
+    root = _committed_repo(tmp_path)
+    sha = ra.head_sha(root)
+    for arm in (ra.CONTROL, ra.STRIPPED):
+        rec = ra.run_one(root, sha, arm, 1, "x", [], None, "pwd -P > cwd.txt", 60, False)
+        seen = [l[1:] for l in rec["diff"].splitlines() if l.startswith("+") and not l.startswith("+++")]
+        assert len(seen) == 1 and seen[0].startswith("/"), rec   # the probe ran and wrote a path
+        for name in (ra.CONTROL, ra.STRIPPED):
+            assert name not in seen[0], "arm %s runs in %s" % (arm, seen[0])

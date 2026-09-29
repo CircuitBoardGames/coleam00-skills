@@ -352,7 +352,9 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
             snapshots: list[Path] | None = None) -> dict:
     """One worktree, one agent session, one diff. Fresh worktree per run so runs
     never compound on each other."""
-    tmp = Path(tempfile.mkdtemp(prefix=f"ablate-{arm}-{index}-"))
+    # The arm is NOT in the path: the agent sees its working directory, and a run that named it in
+    # its final message told the blind grader which arm it was in (hub AGENTS.md ablation, round 3).
+    tmp = Path(tempfile.mkdtemp(prefix="ablate-run-"))
     wt = tmp / "repo"
     rec: dict = {"arm": arm, "index": index, "removed": [], "ok": False}
     started = time.time()
