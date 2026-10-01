@@ -157,21 +157,34 @@ def snapshot_cache_hooks(root: Path, match: str, outdir: Path) -> list[Path]:
             raise RuntimeError(f"cache hook {n} gave no output (exit {out.returncode}): {command}")
         f = outdir / f"cache-hook-{n}.txt"
         f.write_text(out.stdout, encoding="utf-8")
+        # The command beside its output, so --strip-cache can choose one page by its command.
+        f.with_suffix(".cmd").write_text(command, encoding="utf-8")
         snaps.append(f)
     return snaps
 
 
-def surface_project_settings(arm: str, snapshots: list[Path]) -> dict:
+def stripped_caches(snapshots: list[Path], strip: tuple) -> list[Path]:
+    """The snapshots the stripped arm loses: those whose hook command contains any of `strip`, or
+    all of them when `strip` is empty (`--strip-surface caches` alone strips every cache)."""
+    if not strip:
+        return list(snapshots)
+    return [s for s in snapshots if any(t in s.with_suffix(".cmd").read_text(encoding="utf-8") for t in strip)]
+
+
+def surface_project_settings(arm: str, snapshots: list[Path], strip: tuple = ()) -> dict:
     """The throwaway worktree's .claude/settings.json when the caches are under test.
 
     Both arms lose every other project hook and project-enabled plugin (their side effects are
-    the hazard --no-hooks exists for); only the control arm replays the cache snapshots.
+    the hazard --no-hooks exists for). The control arm replays every cache snapshot; the stripped
+    arm replays the ones `--strip-cache` did not name (none, without it).
     Project settings stay a live source, which is what keeps AGENTS.md/CLAUDE.md loading:
     `--setting-sources user` stops them (measured on Opus, claude 2.1.280)."""
-    if arm != CONTROL:
+    gone = set(stripped_caches(snapshots, strip)) if arm != CONTROL else set()
+    kept = [f for f in snapshots if f not in gone]
+    if not kept:
         return {}
     return {"hooks": {"SessionStart": [{"hooks": [
-        {"type": "command", "command": f"cat {shlex.quote(str(f))}"} for f in snapshots]}]}}
+        {"type": "command", "command": f"cat {shlex.quote(str(f))}"} for f in kept]}]}}
 
 
 def claude_config_dir() -> Path:
@@ -310,13 +323,16 @@ def apply_variant(wt: Path, patch: Path) -> list[str]:
     """The variant arm: the layer stays whole and one patch changes it -- a shortened message,
     a reworded rule -- so the two arms differ by exactly that edit instead of by the whole layer.
 
-    The patched paths are hidden the same way stripped ones are, for the same reason: otherwise
-    `git add -A` stages the patch and the captured diff labels its own arm."""
+    The patch is folded INTO the run's one snapshot commit, so the patched tree is this arm's base:
+    otherwise `git add -A` stages the patch and the captured diff labels its own arm. It used to be
+    hidden with skip-worktree, which cannot hide a file the patch ADDS (untracked, so `git diff`
+    never listed it) -- exactly what a rules-in-their-new-homes patch does (hub#1780) -- and which
+    also hid an agent's own later edit to a patched file. Amending fixes both."""
     git(["apply", str(patch)], wt)
-    paths = [l for l in git(["diff", "--name-only"], wt).splitlines() if l]
-    # ponytail: skip-worktree hides an agent's OWN later edit to a patched file from the diff
-    # too. Patch files the task has no reason to touch (hook scripts, rules), not its sources.
-    hide_stripped(wt, paths)
+    git(["add", "-A"], wt)
+    paths = [l for l in git(["diff", "--cached", "--name-only"], wt).splitlines() if l]
+    git(["-c", "user.name=ablate", "-c", "user.email=ablate@localhost", "-c", "commit.gpgsign=false",
+         "commit", "-q", "--amend", "--no-edit", "--no-verify"], wt)
     return paths
 
 
@@ -349,7 +365,7 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
             timeout: int, keep: bool, no_hooks: bool = False,
             allowed_tools: list[str] | None = None, hooks_only: str | None = None,
             variant_patch: Path | None = None, strip_surfaces: tuple = (),
-            snapshots: list[Path] | None = None) -> dict:
+            snapshots: list[Path] | None = None, strip_caches: tuple = ()) -> dict:
     """One worktree, one agent session, one diff. Fresh worktree per run so runs
     never compound on each other."""
     # The arm is NOT in the path: the agent sees its working directory, and a run that named it in
@@ -365,11 +381,20 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
         extra: dict = {}
         if strip_surfaces:
             # The repo layer stays whole in both arms; only the named outside surfaces move.
+            # A variant patch, if any, is the stripped arm's REPLACEMENT for what it loses (hub#1780:
+            # the MEMORY.md arm gets its rules in their new homes). Applied before settings.json is
+            # rewritten, so the patch's own diff cannot pick that file up.
+            if arm == STRIPPED and variant_patch:
+                rec["patched"] = apply_variant(wt, variant_patch)
             if "caches" in strip_surfaces:
                 (wt / ".claude").mkdir(exist_ok=True)
                 (wt / ".claude" / "settings.json").write_text(
-                    json.dumps(surface_project_settings(arm, snapshots or [])), encoding="utf-8")
+                    json.dumps(surface_project_settings(arm, snapshots or [], strip_caches)),
+                    encoding="utf-8")
                 hide_stripped(wt, [".claude/settings.json"])
+                if arm == STRIPPED:
+                    rec["stripped_caches"] = [s.with_suffix(".cmd").read_text(encoding="utf-8")
+                                              for s in stripped_caches(snapshots or [], strip_caches)]
             if "user-claude-md" in strip_surfaces and arm == STRIPPED:
                 extra["claudeMdExcludes"] = [str(claude_config_dir() / "CLAUDE.md")]
             rec["stripped_surfaces"] = list(strip_surfaces) if arm == STRIPPED else []
@@ -472,14 +497,20 @@ def main() -> int:
     ap.add_argument("--cache-hook-match", default="cache-inject", metavar="TEXT",
                     help="with --strip-surface caches: the project SessionStart hooks whose command "
                          "contains TEXT are the caches (default: cache-inject)")
+    ap.add_argument("--strip-cache", action="append", default=[], metavar="TEXT",
+                    help="with --strip-surface caches: the stripped arm loses only the cache hooks whose "
+                         "command contains TEXT (repeatable) and still replays the rest; without it, "
+                         "every cache is stripped. A TEXT matching no cache hook is an error")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, run nothing")
     args = ap.parse_args()
     if args.no_hooks and args.hooks_only:
         ap.error("--no-hooks and --hooks-only both decide which hooks run; pass one")
     strip_surfaces = tuple(dict.fromkeys(args.strip_surface))
-    if strip_surfaces and (args.hooks_only or args.variant_patch):
+    if strip_surfaces and args.hooks_only:
         ap.error("--strip-surface decides what the second arm lacks; it cannot combine with "
-                 "--hooks-only or --variant-patch")
+                 "--hooks-only")
+    if args.strip_cache and "caches" not in strip_surfaces:
+        ap.error("--strip-cache chooses which caches --strip-surface caches strips; pass that too")
     if "caches" in strip_surfaces and args.no_hooks:
         ap.error("--strip-surface caches replays the caches through a hook; --no-hooks would silence "
                  "it in the control arm too (both arms already lose every other project hook)")
@@ -517,7 +548,9 @@ def main() -> int:
     print(f"base    {sha[:12]}" + ("   (WORKING TREE IS DIRTY: worktrees are built from "
                                    "HEAD, so uncommitted edits are NOT under test)"
                                    if is_dirty(root) else ""))
-    if patch:
+    if patch and strip_surfaces:
+        print(f"strip   {', '.join(strip_surfaces)} in the second arm, which ALSO applies {patch}")
+    elif patch:
         print(f"variant {patch} applied in the second arm; the layer is NOT stripped")
     elif strip_surfaces:
         print(f"strip   {', '.join(strip_surfaces)} in the second arm; the repo layer stays whole in both")
@@ -568,6 +601,12 @@ def main() -> int:
     exclude_results(root, out)
     snapshots = (snapshot_cache_hooks(root, args.cache_hook_match, out / "cache-snapshots")
                  if "caches" in strip_surfaces else None)
+    strip_caches = tuple(args.strip_cache)
+    for text in strip_caches:  # one page at a time must still strip SOMETHING (hub#1780)
+        if not stripped_caches(snapshots or [], (text,)):
+            print(f"--strip-cache {text!r} matches no snapshotted cache hook; nothing to strip",
+                  file=sys.stderr)
+            return 2
 
     jobs = [(arm, i) for arm in (CONTROL, STRIPPED) for i in range(1, args.runs + 1)]
     print(f"\nrunning {total} sessions, writing to {out}\n")
@@ -577,7 +616,7 @@ def main() -> int:
             pool.submit(run_one, root, sha, arm, i, prompt, targets,
                         args.model, args.runner, args.timeout, args.keep_worktrees,
                         args.no_hooks, args.allowed_tools, hooks_only, patch,
-                        strip_surfaces, snapshots): (arm, i)
+                        strip_surfaces, snapshots, strip_caches): (arm, i)
             for arm, i in jobs
         }
         for fut in concurrent.futures.as_completed(futures):

@@ -168,6 +168,18 @@ def test_the_variant_patch_is_applied_and_absent_from_the_captured_diff(tmp_path
     assert ra.git(["diff", "--cached", "--name-only"], root).split() == ["new.py"]
 
 
+def test_a_patch_that_ADDS_a_file_is_absent_from_the_captured_diff_too(tmp_path):
+    """hub#1780: skip-worktree cannot hide an untracked file, so an added rules file leaked into the
+    arm's own diff and labelled it. The patch is now part of the arm's base commit."""
+    root = _committed_repo(tmp_path)
+    patch = tmp_path / "add.patch"
+    patch.write_text("--- /dev/null\n+++ b/RULES.md\n@@ -0,0 +1 @@\n+moved rule\n")
+    assert ra.apply_variant(root, patch) == ["RULES.md"]
+    (root / "new.py").write_text("x = 1\n")
+    ra.git(["add", "-A"], root)
+    assert ra.git(["diff", "--cached", "--name-only"], root).split() == ["new.py"]
+
+
 def test_an_unhidden_patch_leaks_into_the_diff__control(tmp_path):
     """PASSES ON BASE: the leak apply_variant hides, so the test above cannot pass vacuously."""
     root = _committed_repo(tmp_path)
@@ -286,8 +298,7 @@ def test_the_user_instruction_file_is_excluded_in_the_stripped_arm_only(claude_o
 
 @pytest.mark.parametrize("extra, says", [
     (["--no-hooks"], "would silence it in the control arm"),
-    (["--variant-patch", "x.patch"], "cannot combine with --hooks-only or --variant-patch"),
-    (["--hooks-only", "h.json"], "cannot combine with --hooks-only or --variant-patch"),
+    (["--hooks-only", "h.json"], "cannot combine with --hooks-only"),
 ])
 def test_strip_surface_refuses_modes_that_would_silence_or_replace_it(tmp_path, extra, says):
     task = tmp_path / "task.md"
@@ -352,3 +363,73 @@ def test_the_working_directory_does_not_name_the_arm(tmp_path):
         assert len(seen) == 1 and seen[0].startswith("/"), rec   # the probe ran and wrote a path
         for name in (ra.CONTROL, ra.STRIPPED):
             assert name not in seen[0], "arm %s runs in %s" % (arm, seen[0])
+
+
+# --- hub#1780: a strip combined with a patch, and one cache page at a time ----------------------
+
+def test_a_variant_patch_now_combines_with_a_strip_and_patches_the_stripped_arm_only(tmp_path):
+    """The MEMORY.md replacement arm: no MEMORY.md, and the migrated rules in their new homes."""
+    root = _committed_repo(tmp_path)
+    patch = tmp_path / "rules.patch"
+    patch.write_text("--- /dev/null\n+++ b/RULES.md\n@@ -0,0 +1 @@\n+moved rule\n")
+    sha = ra.head_sha(root)
+    recs = {arm: ra.run_one(root, sha, arm, 1, "x", [], None, "true", 60, False,
+                            variant_patch=patch, strip_surfaces=("memory",))
+            for arm in (ra.CONTROL, ra.STRIPPED)}
+    assert recs[ra.STRIPPED].get("patched") == ["RULES.md"], recs[ra.STRIPPED]
+    assert recs[ra.STRIPPED]["stripped_surfaces"] == ["memory"]       # both recorded
+    assert "patched" not in recs[ra.CONTROL] and recs[ra.CONTROL]["stripped_surfaces"] == []
+    assert not recs[ra.STRIPPED]["files_changed"]                     # the patch is not the arm's diff
+
+
+def test_the_cli_accepts_a_strip_with_a_patch(tmp_path):
+    task = tmp_path / "task.md"
+    task.write_text("do a thing")
+    root = _committed_repo(tmp_path)
+    patch = tmp_path / "rules.patch"
+    patch.write_text("--- /dev/null\n+++ b/RULES.md\n@@ -0,0 +1 @@\n+moved rule\n")
+    out = subprocess.run([sys.executable, str(SCRIPTS / "run_ablation.py"), str(root), "--task-file",
+                          str(task), "--strip-surface", "memory", "--variant-patch", str(patch),
+                          "--dry-run"], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert "ALSO applies" in out.stdout
+
+
+def test_strip_cache_strips_one_page_and_keeps_the_other(tmp_path):
+    root = _repo_with_hooks(tmp_path, ["echo HOT # cache-inject Hot Cache",
+                                       "echo SESS # cache-inject Session Cache"])
+    snaps = ra.snapshot_cache_hooks(root, "cache-inject", tmp_path / "snaps")
+    sha = ra.head_sha(root)
+    seen, recs = {}, {}
+    for arm in (ra.CONTROL, ra.STRIPPED):
+        recs[arm] = ra.run_one(root, sha, arm, 1, "x", [], None, "cp .claude/settings.json seen.json",
+                               60, False, strip_surfaces=("caches",), snapshots=snaps,
+                               strip_caches=("Hot Cache",))
+        added = [l[1:] for l in recs[arm]["diff"].splitlines() if l.startswith("+") and not l.startswith("+++")]
+        seen[arm] = [h["command"] for g in json.loads("".join(added)).get("hooks", {}).get("SessionStart", [])
+                     for h in g["hooks"]]
+    hot, sess = snaps
+    assert seen[ra.CONTROL] == [f"cat {hot}", f"cat {sess}"]   # control: both pages
+    assert seen[ra.STRIPPED] == [f"cat {sess}"]                 # stripped: the Session Cache only
+    assert recs[ra.STRIPPED]["stripped_caches"] == ["echo HOT # cache-inject Hot Cache"]
+
+
+def test_a_strip_cache_matching_no_page_is_an_error_not_an_empty_strip(tmp_path):
+    root = _repo_with_hooks(tmp_path, ["echo HOT # cache-inject Hot Cache"])
+    task = tmp_path / "task.md"
+    task.write_text("do a thing")
+    out = subprocess.run([sys.executable, str(SCRIPTS / "run_ablation.py"), str(root), "--task-file",
+                          str(task), "--strip-surface", "caches", "--strip-cache", "Session Cache",
+                          "--runner", "true", "--runs", "1", "--out", str(tmp_path / "out")],
+                         capture_output=True, text=True)
+    assert out.returncode == 2 and "matches no snapshotted cache hook" in out.stderr, out.stderr
+    assert not list((tmp_path / "out").glob("*.diff"))           # no run started
+
+
+def test_strip_cache_needs_the_caches_surface(tmp_path):
+    task = tmp_path / "task.md"
+    task.write_text("do a thing")
+    out = subprocess.run([sys.executable, str(SCRIPTS / "run_ablation.py"), str(tmp_path), "--task-file",
+                          str(task), "--strip-surface", "memory", "--strip-cache", "Hot Cache",
+                          "--dry-run"], capture_output=True, text=True)
+    assert out.returncode == 2 and "pass that too" in " ".join(out.stderr.split())
