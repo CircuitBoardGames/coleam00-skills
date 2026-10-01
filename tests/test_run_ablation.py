@@ -433,3 +433,52 @@ def test_strip_cache_needs_the_caches_surface(tmp_path):
                           str(task), "--strip-surface", "memory", "--strip-cache", "Hot Cache",
                           "--dry-run"], capture_output=True, text=True)
     assert out.returncode == 2 and "pass that too" in " ".join(out.stderr.split())
+
+
+# --- hub#1779: a recall plugin as the stripped arm's replacement, isolated by its own env --------
+
+def _settings_seen(rec: dict) -> dict:
+    added = [l[1:] for l in rec["diff"].splitlines() if l.startswith("+") and not l.startswith("+++")]
+    return json.loads("".join(added))
+
+
+def test_the_stripped_plugin_is_enabled_in_the_stripped_arm_only_and_other_hooks_are_off(tmp_path):
+    root = _repo_with_hooks(tmp_path, ["echo side-effect"])   # a project hook that must not run
+    sha = ra.head_sha(root)
+    seen = {arm: _settings_seen(ra.run_one(
+        root, sha, arm, 1, "x", [], None, "cp .claude/settings.json seen.json", 60, False,
+        strip_surfaces=("memory",), stripped_plugin="hindsight-memory@hindsight"))
+        for arm in (ra.CONTROL, ra.STRIPPED)}
+    assert seen[ra.STRIPPED] == {"enabledPlugins": {"hindsight-memory@hindsight": True}}
+    assert seen[ra.CONTROL] == {}
+    # Without the rewrite a memory-only strip ran every project hook and plugin in BOTH arms, so a
+    # recall plugin's retain would have written to the live bank.
+    assert "side-effect" not in json.dumps(seen)
+
+
+def test_the_stripped_env_reaches_the_stripped_arm_only(tmp_path, monkeypatch):
+    monkeypatch.delenv("ABLATE_PROBE", raising=False)
+    root = _committed_repo(tmp_path)
+    sha = ra.head_sha(root)
+    recs = {arm: ra.run_one(root, sha, arm, 1, "x", [], None,
+                            'printf "%s" "${ABLATE_PROBE:-unset}" > seen.txt', 60, False,
+                            strip_surfaces=("memory",), stripped_env={"ABLATE_PROBE": "snapshot"})
+            for arm in (ra.CONTROL, ra.STRIPPED)}
+    def written(rec):
+        return [l[1:] for l in rec["diff"].splitlines() if l.startswith("+") and not l.startswith("+++")]
+    assert written(recs[ra.STRIPPED]) == ["snapshot"]
+    assert written(recs[ra.CONTROL]) == ["unset"]
+    assert recs[ra.STRIPPED]["stripped_env"] == ["ABLATE_PROBE"] and "stripped_env" not in recs[ra.CONTROL]
+
+
+@pytest.mark.parametrize("extra, says", [
+    (["--stripped-plugin", "p@m"], "need --strip-surface"),
+    (["--strip-surface", "memory", "--stripped-plugin", "p@m", "--no-hooks"], "would silence the plugin"),
+    (["--strip-surface", "memory", "--stripped-env", "NOEQUALS"], "takes KEY=VALUE"),
+])
+def test_the_recall_arm_flags_refuse_what_would_defeat_them(tmp_path, extra, says):
+    task = tmp_path / "task.md"
+    task.write_text("do a thing")
+    out = subprocess.run([sys.executable, str(SCRIPTS / "run_ablation.py"), str(tmp_path), "--task-file",
+                          str(task), *extra, "--dry-run"], capture_output=True, text=True)
+    assert out.returncode == 2 and says in " ".join(out.stderr.split()), out.stderr

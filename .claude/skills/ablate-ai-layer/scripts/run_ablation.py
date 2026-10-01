@@ -171,7 +171,8 @@ def stripped_caches(snapshots: list[Path], strip: tuple) -> list[Path]:
     return [s for s in snapshots if any(t in s.with_suffix(".cmd").read_text(encoding="utf-8") for t in strip)]
 
 
-def surface_project_settings(arm: str, snapshots: list[Path], strip: tuple = ()) -> dict:
+def surface_project_settings(arm: str, snapshots: list[Path], strip: tuple = (),
+                             plugin: str | None = None) -> dict:
     """The throwaway worktree's .claude/settings.json when the caches are under test.
 
     Both arms lose every other project hook and project-enabled plugin (their side effects are
@@ -181,10 +182,15 @@ def surface_project_settings(arm: str, snapshots: list[Path], strip: tuple = ())
     `--setting-sources user` stops them (measured on Opus, claude 2.1.280)."""
     gone = set(stripped_caches(snapshots, strip)) if arm != CONTROL else set()
     kept = [f for f in snapshots if f not in gone]
-    if not kept:
-        return {}
-    return {"hooks": {"SessionStart": [{"hooks": [
-        {"type": "command", "command": f"cat {shlex.quote(str(f))}"} for f in kept]}]}}
+    settings: dict = {}
+    if kept:
+        settings["hooks"] = {"SessionStart": [{"hooks": [
+            {"type": "command", "command": f"cat {shlex.quote(str(f))}"} for f in kept]}]}
+    # --stripped-plugin (hub#1779): the stripped arm's REPLACEMENT for what it loses, e.g. Hindsight
+    # recall standing in for the Hot Cache. Only that arm enables it; the control enables nothing.
+    if plugin and arm == STRIPPED:
+        settings["enabledPlugins"] = {plugin: True}
+    return settings
 
 
 def claude_config_dir() -> Path:
@@ -365,7 +371,8 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
             timeout: int, keep: bool, no_hooks: bool = False,
             allowed_tools: list[str] | None = None, hooks_only: str | None = None,
             variant_patch: Path | None = None, strip_surfaces: tuple = (),
-            snapshots: list[Path] | None = None, strip_caches: tuple = ()) -> dict:
+            snapshots: list[Path] | None = None, strip_caches: tuple = (),
+            stripped_plugin: str | None = None, stripped_env: dict | None = None) -> dict:
     """One worktree, one agent session, one diff. Fresh worktree per run so runs
     never compound on each other."""
     # The arm is NOT in the path: the agent sees its working directory, and a run that named it in
@@ -386,13 +393,18 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
             # rewritten, so the patch's own diff cannot pick that file up.
             if arm == STRIPPED and variant_patch:
                 rec["patched"] = apply_variant(wt, variant_patch)
-            if "caches" in strip_surfaces:
+            if "caches" in strip_surfaces or stripped_plugin:
+                # Rewritten in BOTH arms: left alone, every project hook and project-enabled plugin
+                # runs in both, and a recall plugin's retain would write to the live bank.
                 (wt / ".claude").mkdir(exist_ok=True)
                 (wt / ".claude" / "settings.json").write_text(
-                    json.dumps(surface_project_settings(arm, snapshots or [], strip_caches)),
+                    json.dumps(surface_project_settings(arm, snapshots or [], strip_caches,
+                                                        stripped_plugin)),
                     encoding="utf-8")
                 hide_stripped(wt, [".claude/settings.json"])
-                if arm == STRIPPED:
+                if arm == STRIPPED and stripped_plugin:
+                    rec["stripped_plugin"] = stripped_plugin
+                if arm == STRIPPED and "caches" in strip_surfaces:
                     rec["stripped_caches"] = [s.with_suffix(".cmd").read_text(encoding="utf-8")
                                               for s in stripped_caches(snapshots or [], strip_caches)]
             if "user-claude-md" in strip_surfaces and arm == STRIPPED:
@@ -416,9 +428,13 @@ def run_one(root: Path, sha: str, arm: str, index: int, prompt: str,
             (memory / "MEMORY.md").unlink(missing_ok=True)
         cmd, use_shell = build_command(model, runner, no_hooks, allowed_tools, hooks_only, memory,
                                        extra)
+        env = None
+        if arm == STRIPPED and stripped_env:
+            env = {**os.environ, **stripped_env}
+            rec["stripped_env"] = sorted(stripped_env)
         proc = subprocess.run(
             cmd, cwd=str(wt), input=prompt, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout, shell=use_shell)
+            encoding="utf-8", errors="replace", timeout=timeout, shell=use_shell, env=env)
 
         rec["exit_code"] = proc.returncode
         rec["stderr_tail"] = (proc.stderr or "")[-600:]
@@ -501,6 +517,13 @@ def main() -> int:
                     help="with --strip-surface caches: the stripped arm loses only the cache hooks whose "
                          "command contains TEXT (repeatable) and still replays the rest; without it, "
                          "every cache is stripped. A TEXT matching no cache hook is an error")
+    ap.add_argument("--stripped-plugin", default=None, metavar="NAME",
+                    help="with --strip-surface: the stripped arm enables ONLY this plugin (e.g. "
+                         "hindsight-memory@hindsight) as its replacement for what it loses; the control "
+                         "arm enables none, and every other project hook and plugin is off in both")
+    ap.add_argument("--stripped-env", action="append", default=[], metavar="KEY=VALUE",
+                    help="with --strip-surface: an environment variable for the stripped arm only "
+                         "(repeatable), e.g. HINDSIGHT_API_URL pointing its plugin at a snapshot")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, run nothing")
     args = ap.parse_args()
     if args.no_hooks and args.hooks_only:
@@ -509,6 +532,15 @@ def main() -> int:
     if strip_surfaces and args.hooks_only:
         ap.error("--strip-surface decides what the second arm lacks; it cannot combine with "
                  "--hooks-only")
+    if (args.stripped_plugin or args.stripped_env) and not strip_surfaces:
+        ap.error("--stripped-plugin and --stripped-env give the STRIPPED arm its replacement; they "
+                 "need --strip-surface")
+    if args.stripped_plugin and args.no_hooks:
+        ap.error("--no-hooks would silence the plugin --stripped-plugin enables")
+    bad = [e for e in args.stripped_env if "=" not in e or not e.split("=", 1)[0]]
+    if bad:
+        ap.error(f"--stripped-env takes KEY=VALUE: {bad}")
+    stripped_env = dict(e.split("=", 1) for e in args.stripped_env)
     if args.strip_cache and "caches" not in strip_surfaces:
         ap.error("--strip-cache chooses which caches --strip-surface caches strips; pass that too")
     if "caches" in strip_surfaces and args.no_hooks:
@@ -616,7 +648,8 @@ def main() -> int:
             pool.submit(run_one, root, sha, arm, i, prompt, targets,
                         args.model, args.runner, args.timeout, args.keep_worktrees,
                         args.no_hooks, args.allowed_tools, hooks_only, patch,
-                        strip_surfaces, snapshots, strip_caches): (arm, i)
+                        strip_surfaces, snapshots, strip_caches, args.stripped_plugin,
+                        stripped_env): (arm, i)
             for arm, i in jobs
         }
         for fut in concurrent.futures.as_completed(futures):

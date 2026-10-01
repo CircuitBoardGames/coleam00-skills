@@ -94,9 +94,14 @@ That also removes context a hook injects, so the report must say hook-delivered 
 **To ablate an always-loaded surface that lives OUTSIDE the repo, use `--strip-surface`** with any of `user-claude-md` (`~/.claude/CLAUDE.md`), `memory` (`MEMORY.md`) and `caches` (text that project SessionStart hooks inject; `--cache-hook-match` picks the hooks, default `cache-inject`). The repo layer stays whole in both arms, and only the named surfaces are missing from the second.
 - `user-claude-md` passes `claudeMdExcludes` to that arm.
 - `memory` removes `MEMORY.md` from that arm's scratch memory copy.
-- `caches` snapshots the matching hooks' output once. Each arm's `.claude/settings.json` is rewritten: the control arm replays the snapshots, the stripped arm gets no hooks, and both lose every other project hook and plugin.
+- `caches` snapshots the matching hooks' output once. Each arm's `.claude/settings.json` is rewritten: the control arm replays the snapshots, the stripped arm gets no hooks, and both lose every other project hook and plugin. `--strip-cache TEXT` (repeatable) strips only the cache hooks whose command contains TEXT, so the stripped arm keeps replaying the others. A TEXT that matches none is an error.
 
-It refuses `--no-hooks`, `--hooks-only` and `--variant-patch`. Measured on Opus (claude 2.1.280) and end to end: `AGENTS.md` loads in both arms, and each surface is present in one arm and absent in the other.
+**The stripped arm can also get a REPLACEMENT for what it loses:**
+- `--variant-patch PATCH` applies a patch to that arm only, e.g. the rules a removed `MEMORY.md` moved to. The patch becomes part of the arm's base commit, so it is never in the arm's diff, even when it adds files.
+- `--stripped-plugin NAME` enables only that plugin in that arm, e.g. `hindsight-memory@hindsight` standing in for a cache. It forces the settings rewrite in both arms, so no other project hook or plugin runs in either.
+- `--stripped-env KEY=VALUE` (repeatable) sets environment for that arm only. Use it to point the plugin at an isolated copy of its backend (`HINDSIGHT_API_URL=http://127.0.0.1:<port>`), never at the live one.
+
+It refuses `--no-hooks` and `--hooks-only`. Measured on Opus (claude 2.1.280) and end to end: `AGENTS.md` loads in both arms, and each surface is present in one arm and absent in the other.
 
 **`--hooks-only` stops the project's `AGENTS.md`/`CLAUDE.md` loading in BOTH arms.** `--setting-sources user` drops project instructions along with project settings (measured on Opus, claude 2.1.280). Use it only when the instruction files are not part of what you are comparing.
 
