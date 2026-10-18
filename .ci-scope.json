@@ -1,0 +1,8 @@
+{
+  "tests_dir": "tests",
+  "map": "tests/impact-map.json",
+  "path_roots": [".claude", ".claude-plugin", ".forgejo", "hooks", "tests"],
+  "import_roots": [".claude/skills/ablate-ai-layer/scripts/"],
+  "machinery": [".forgejo/workflows/python.yml"],
+  "pytest_cmd": ".ci-venv/bin/python -m pytest"
+}
