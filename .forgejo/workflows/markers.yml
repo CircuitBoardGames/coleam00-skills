@@ -8,6 +8,8 @@ on:
   pull_request:
 jobs:
   conflict-markers:
+    # A draft never runs this: it runs once un-drafted.
+    if: ${{ !github.event.pull_request.draft }}
     name: no conflict markers
     runs-on: ubuntu-latest
     steps:

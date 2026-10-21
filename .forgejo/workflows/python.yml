@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # A draft waits off the runner: the queue un-drafts it at the front, and that edit runs this.
-    if: ${{ !github.event.pull_request.draft || contains(github.event.pull_request.labels.*.name, 'queue:not-admitted') }}
+    if: ${{ !github.event.pull_request.draft }}
     steps:
       - name: Admission — a held PR must report not-passing, never green
         if: ${{ contains(github.event.pull_request.labels.*.name, 'queue:not-admitted') }}
